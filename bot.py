@@ -1,6 +1,4 @@
 import os
-import io
-import time
 import logging
 import requests
 from datetime import datetime, timezone, timedelta
@@ -19,7 +17,6 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# Джерела
 SVITLOBOT_API = "https://api.svitlobot.in.ua/website/getChannelsForMap"
 TRYVOHA_API = "https://tryvoha.online/api/v1/alerts"
 
@@ -29,9 +26,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Стан тривоги (щоб не спамити)
+# Стан тривоги
 last_alert_state = None
-last_alert_level = None
+last_alert_message_id = None   # щоб видаляти попереднє повідомлення
 
 # ================== СТАТИСТИКА СВІТЛА ==================
 def get_svitlobot_stats():
@@ -79,7 +76,7 @@ def create_stats_image(stats):
     colors = ["#00c853", "#ff1744", "#9e9e9e"]
     explode = (0.02, 0.02, 0.02)
 
-    wedges, texts = ax.pie(
+    wedges, _ = ax.pie(
         sizes,
         colors=colors,
         startangle=90,
@@ -87,11 +84,9 @@ def create_stats_image(stats):
         wedgeprops=dict(width=0.35, edgecolor="#1a1a2e", linewidth=3)
     )
 
-    # Центральний круг
     centre_circle = Circle((0, 0), 0.55, fc="#1a1a2e")
     ax.add_patch(centre_circle)
 
-    # Текст у центрі
     ax.text(0, 0.12, f"{stats['on_pct']}%", 
             ha="center", va="center", fontsize=42, fontweight="bold", color="#00c853")
     ax.text(0, -0.18, "зі світлом", 
@@ -99,7 +94,6 @@ def create_stats_image(stats):
 
     ax.set_title("Стан світла в Києві", fontsize=20, color="white", pad=20, fontweight="bold")
 
-    # Легенда
     legend_labels = [
         f"Світло є  {stats['on_pct']}%",
         f"Без світла  {stats['off_pct']}%",
@@ -119,7 +113,6 @@ def create_stats_image(stats):
 
 # ================== ТРИВОГА ==================
 def get_kyiv_alert():
-    """Повертає dict з інформацією про тривогу в м. Київ"""
     try:
         r = requests.get(TRYVOHA_API, timeout=10)
         r.raise_for_status()
@@ -168,9 +161,13 @@ def format_alert_message(alert, is_start=True):
 
 # ================== КОМАНДИ ==================
 async def cmd_svitlo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Спочатку повідомлення "Завантажую..."
+    loading_msg = await update.message.reply_text("⏳ Завантажую статистику...")
+
     stats = get_svitlobot_stats()
+    
     if not stats:
-        await update.message.reply_text("Не вдалося отримати дані зі Svitlobot 😔")
+        await loading_msg.edit_text("Не вдалося отримати дані зі Svitlobot 😔")
         return
 
     img = create_stats_image(stats)
@@ -179,7 +176,17 @@ async def cmd_svitlo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🌑 Без світла: {stats['off_pct']}%\n\n"
         f"Джерело: svitlobot.in.ua"
     )
-    await update.message.reply_photo(photo=InputFile(img, filename="svitlo.png"), caption=caption)
+
+    # Видаляємо "Завантажую..." і кидаємо фото
+    try:
+        await loading_msg.delete()
+    except:
+        pass
+
+    await update.message.reply_photo(
+        photo=InputFile(img, filename="svitlo.png"),
+        caption=caption
+    )
 
 
 async def cmd_trivoga(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -236,27 +243,40 @@ async def send_stats(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def check_alert(context: ContextTypes.DEFAULT_TYPE):
-    global last_alert_state, last_alert_level
+    global last_alert_state, last_alert_message_id
     
     alert = get_kyiv_alert()
     if alert is None:
         return
 
     current_state = alert["active"]
-    current_level = alert.get("level")
 
     # Тривога тільки що почалася
     if current_state and not last_alert_state:
+        # Видаляємо попереднє повідомлення (якщо було)
+        if last_alert_message_id:
+            try:
+                await context.bot.delete_message(chat_id=CHAT_ID, message_id=last_alert_message_id)
+            except:
+                pass
+
         msg = format_alert_message(alert, is_start=True)
-        await context.bot.send_message(chat_id=CHAT_ID, text=msg)
-    
+        sent = await context.bot.send_message(chat_id=CHAT_ID, text=msg)
+        last_alert_message_id = sent.message_id
+
     # Відбій
     elif not current_state and last_alert_state:
+        if last_alert_message_id:
+            try:
+                await context.bot.delete_message(chat_id=CHAT_ID, message_id=last_alert_message_id)
+            except:
+                pass
+
         msg = format_alert_message(alert, is_start=False)
-        await context.bot.send_message(chat_id=CHAT_ID, text=msg)
+        sent = await context.bot.send_message(chat_id=CHAT_ID, text=msg)
+        last_alert_message_id = sent.message_id
 
     last_alert_state = current_state
-    last_alert_level = current_level
 
 
 # ================== ЗАПУСК ==================
@@ -267,11 +287,9 @@ def main():
 
     app = Application.builder().token(TOKEN).build()
 
-    # Команди
     app.add_handler(CommandHandler("svitlo", cmd_svitlo))
     app.add_handler(CommandHandler("trivoga", cmd_trivoga))
 
-    # Планувальник
     scheduler = AsyncIOScheduler(timezone="Europe/Kyiv")
     
     # Статистика кожні 4 години
