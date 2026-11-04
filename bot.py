@@ -82,32 +82,25 @@ def save_state():
 
 # -------------------- ОТРИМАННЯ ДАНИХ --------------------
 def get_svitlobot_stats():
+    """Повертає статистику лише для записів міста Києва."""
     response = requests.get(SVITLOBOT_API, timeout=20)
     response.raise_for_status()
 
-    # API повертає плоский список полів. Один запис містить 11 полів:
-    # [службове ID, службове поле, службове поле, назва, канал,
-    #  кількість, широта, довгота, СТАТУС, група, службове поле].
-    fields = [item.strip() for item in response.text.strip().split(";&&&;")]
-    record_size = 11
     on = off = tech = 0
     kyiv_records = 0
-    malformed_records = 0
 
-    for start in range(0, len(fields), record_size):
-        record = fields[start:start + record_size]
-        if len(record) < record_size:
-            malformed_records += 1
+    # API повертає записи, поля в яких розділені ;&&&;.
+    # У кожному записі: поле 3 — назва/місто, поле 8 — статус.
+    for record in response.text.split(";&&&;"):
+        parts = [part.strip() for part in record.strip().split(";")]
+        if len(parts) <= 8:
             continue
 
-        # Назва об'єкта розташована в полі 3. У статистику Києва
-        # включаємо тільки об'єкти, назва яких починається з "Київ".
-        object_name = record[3]
-        if not object_name.casefold().startswith("київ"):
-            continue
+        location = parts[3]
+        status = parts[8]
 
-        status = record[8]
-        if status not in {"0", "1", "2", "3"}:
+        # Не включаємо Бровари, Ірпінь та інші населені пункти області.
+        if not location.startswith("Київ ->"):
             continue
 
         kyiv_records += 1
@@ -117,20 +110,14 @@ def get_svitlobot_stats():
             off += 1
         elif status == "3":
             tech += 1
-        # Статус 0 не входить до трьох категорій, які показує графік.
 
     total = on + off + tech
     logger.info(
-        "Svitlobot API: записів Києва=%s, враховано=%s, є=%s, немає=%s, технічний=%s, некоректних=%s",
-        kyiv_records, total, on, off, tech, malformed_records
+        "Svitlobot: знайдено записів Києва=%s, враховано зі статусом=%s, є=%s, немає=%s, технічний=%s",
+        kyiv_records, total, on, off, tech,
     )
 
     if total == 0:
-        logger.warning(
-            "Svitlobot повернув відповідь, але не знайдено придатних записів Києва. "
-            "Поля у відповіді: %s",
-            len(fields),
-        )
         return None
 
     return {
