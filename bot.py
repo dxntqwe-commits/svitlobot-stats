@@ -285,20 +285,20 @@ def main():
         logger.error("TELEGRAM_TOKEN або TELEGRAM_CHAT_ID не задані!")
         return
 
-    app = Application.builder().token(TOKEN).build()
+    async def post_init(application):
+        # Виконується всередині запущеного event loop
+        scheduler = AsyncIOScheduler(timezone="Europe/Kyiv")
+        # Статистика кожні 4 години
+        scheduler.add_job(send_stats, "cron", hour="0,4,8,12,16,20", minute=5, args=[application])
+        # Перевірка тривоги кожні 40 секунд
+        scheduler.add_job(check_alert, "interval", seconds=40, args=[application])
+        scheduler.start()
+        application.bot_data["scheduler"] = scheduler
+
+    app = Application.builder().token(TOKEN).post_init(post_init).build()
 
     app.add_handler(CommandHandler("svitlo", cmd_svitlo))
     app.add_handler(CommandHandler("trivoga", cmd_trivoga))
-
-    scheduler = AsyncIOScheduler(timezone="Europe/Kyiv")
-    
-    # Статистика кожні 4 години
-    scheduler.add_job(send_stats, "cron", hour="0,4,8,12,16,20", minute=5, args=[app])
-    
-    # Перевірка тривоги кожні 40 секунд
-    scheduler.add_job(check_alert, "interval", seconds=40, args=[app])
-    
-    scheduler.start()
 
     logger.info("Бот запущено")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
