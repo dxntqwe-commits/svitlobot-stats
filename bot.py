@@ -1,34 +1,32 @@
-import os
-import json
+"""Svitlobot Stats — Telegram-бот: світло по Києву та повітряна тривога.
+
+Запуск: python bot.py   (на Railway — через Procfile: worker: python bot.py)
+"""
+import asyncio
 import logging
-from datetime import datetime, timezone, timedelta
-from io import BytesIO
-from pathlib import Path
-from collections import Counter
+import time
 
-import requests
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-from matplotlib.patches import Circle
-
-from telegram import Update, InputFile
-from telegram.ext import Application, CommandHandler, ContextTypes
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from telegram import BotCommand, InputFile, Update
+from telegram.error import BadRequest
+from telegram.ext import Application, CommandHandler, ContextTypes
 
-# ================== НАЛАШТУВАННЯ ==================
-TOKEN = os.getenv("TELEGRAM_TOKEN")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
-SVITLOBOT_API = "https://api.svitlobot.in.ua/website/getChannelsForMap"
-TRYVOHA_KYIV = "https://tryvoha.online/api/v1/alerts/kyiv"
-MAPA_NEARBY = "https://mapa.ua/api/v1/nearby"
-
-KYIV_LAT, KYIV_LON = 50.4501, 30.5234
-NEARBY_RADIUS_KM = 20
-SVITLO_COOLDOWN_MIN = 15
-
-STATE_FILE = Path(os.getenv("STATE_FILE", "data/state.json"))
+from alerts import (
+    format_alert_end,
+    format_alert_message,
+    get_kyiv_alert,
+    get_nearby_threats,
+)
+from config import ADMIN_IDS, ALERT_REFRESH_MIN, CHAT_ID, KYIV_TZ, SVITLO_COOLDOWN_MIN, TOKEN
+from storage import save_state, set_daily, state
+from svitlo import (
+    create_stats_image,
+    format_districts_full,
+    format_svitlo_caption,
+    get_svitlobot_stats,
+    parse_stats_caption,
+)
+from timeutils import kyiv_date_str, now_kyiv_str, parse_started_at
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -36,258 +34,93 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+HELP_TEXT = (
+    "🤖 Svitlobot Stats — бот про світло та повітряну тривогу в Києві\n\n"
+    "Що вміє:\n"
+    "💡 Показує, скільки датчиків Світлобота в Києві зараз зі світлом, "
+    "і називає райони, де гірше за все (топ-5).\n"
+    "📊 Щодня о 12:05 порівнює світло з учорашнім.\n"
+    "🚨 Повідомляє про початок, зміну рівня та відбій повітряної тривоги; "
+    "під час тривоги кожні 10 хв оновлює цілі навколо міста в тому самому пості.\n"
+    "📌 Закріплює пост про останню тривогу — коли починається нова, старий видаляється.\n"
+    "🔕 Усі повідомлення надсилаються без звуку.\n\n"
+    "Команди:\n"
+    "/svitlo — світло по місту: діаграма + топ-5 районів\n"
+    "/rayony — світло по всіх районах\n"
+    "/tryvoga — статус тривоги і цілі поруч (також /trivoga, /trevoga)\n"
+    "/dopomoga — ця довідка\n\n"
+    "Автоматично: статистика світла о 00:05, 04:05, 08:05, 12:05, 16:05, 20:05; "
+    "тривога перевіряється кожні 40 секунд.\n\n"
+    "ℹ️ Це дані датчиків Світлобота, а не всіх киян. У районах різна кількість "
+    "датчиків — дивіться «з N»: чим менше точок, тим менш надійна цифра.\n\n"
+    "Для адмінів: /vidnovyty — відповіддю на вчорашній пост о 12:05 відновлює "
+    "базу для порівняння, якщо бот перезапускався."
+)
 
-# ================== СТАН ==================
-def load_state() -> dict:
+
+# ================== TELEGRAM-ХЕЛПЕРИ ==================
+async def pin_silently(app: Application, message_id: int):
     try:
-        if STATE_FILE.exists():
-            return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-    except Exception as e:
-        logger.warning(f"Не вдалося прочитати state: {e}")
-    return {
-        "last_alert_active": False,
-        "last_alert_level": None,
-        "alert_message_id": None,
-        "last_svitlo_message_id": None,
-        "last_svitlo_ts": 0,
-    }
-
-
-def save_state(state: dict) -> None:
-    try:
-        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        STATE_FILE.write_text(
-            json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
+        await app.bot.pin_chat_message(
+            chat_id=CHAT_ID, message_id=message_id, disable_notification=True
         )
     except Exception as e:
-        logger.warning(f"Не вдалося зберегти state: {e}")
+        logger.warning(f"Не вдалося закріпити (потрібне право «Закріплювати повідомлення»): {e}")
 
 
-state = load_state()
+async def remove_old_alert_post(app: Application, msg_id):
+    """Відкріплює й видаляє пост попередньої тривоги.
 
-
-# ================== СВІТЛО (тільки Київ) ==================
-def get_svitlobot_stats():
+    Крім id зі стану, перевіряє закріплене повідомлення чату: якщо там наш пост про тривогу
+    (стан міг загубитись після перезапуску) — прибирає і його.
+    """
+    ids = set()
+    if msg_id:
+        ids.add(msg_id)
     try:
-        r = requests.get(SVITLOBOT_API, timeout=15)
-        r.raise_for_status()
-        text = r.text
-
-        on = off = 0
-        for line in text.strip().splitlines():
-            parts = line.rstrip(";").split(";&&&;")
-            if len(parts) < 8:
-                continue
-            status = parts[1].strip()
-            try:
-                lat = float(parts[6])
-                lng = float(parts[7])
-            except (ValueError, IndexError):
-                continue
-            if not (50.20 <= lat <= 50.60 and 30.20 <= lng <= 30.85):
-                continue
-            if status == "1":
-                on += 1
-            elif status == "2":
-                off += 1
-
-        total = on + off
-        if total == 0:
-            return None
-        return {
-            "on": on,
-            "off": off,
-            "total": total,
-            "on_pct": round(on / total * 100, 1),
-            "off_pct": round(off / total * 100, 1),
-        }
+        chat = await app.bot.get_chat(CHAT_ID)
+        pm = chat.pinned_message
+        if (
+            pm is not None
+            and pm.from_user is not None
+            and pm.from_user.id == app.bot.id
+            and "| Київ |" in (pm.text or "")
+        ):
+            ids.add(pm.message_id)
     except Exception as e:
-        logger.error(f"Svitlobot error: {e}")
-        return None
+        logger.info(f"Не вдалося перевірити закріплене повідомлення: {e}")
+
+    for mid in ids:
+        try:
+            await app.bot.unpin_chat_message(chat_id=CHAT_ID, message_id=mid)
+        except Exception as e:
+            logger.info(f"unpin {mid}: {e}")
+        try:
+            await app.bot.delete_message(chat_id=CHAT_ID, message_id=mid)
+        except Exception as e:
+            logger.info(f"Не вдалося видалити {mid} (можливо, старіше 48 год): {e}")
 
 
-def create_stats_image(stats):
-    fig, ax = plt.subplots(figsize=(8, 8), facecolor="#1a1a2e")
-    ax.set_facecolor("#1a1a2e")
-
-    sizes = [stats["on"], stats["off"]]
-    colors = ["#00c853", "#ff1744"]
-    explode = (0.02, 0.02)
-
-    wedges, _ = ax.pie(
-        sizes,
-        colors=colors,
-        startangle=90,
-        explode=explode,
-        wedgeprops=dict(width=0.35, edgecolor="#1a1a2e", linewidth=3),
-    )
-
-    centre_circle = Circle((0, 0), 0.55, fc="#1a1a2e")
-    ax.add_patch(centre_circle)
-
-    ax.text(
-        0, 0.12, f"{stats['on_pct']}%",
-        ha="center", va="center", fontsize=42, fontweight="bold", color="#00c853",
-    )
-    ax.text(
-        0, -0.18, "зі світлом",
-        ha="center", va="center", fontsize=16, color="#e0e0e0",
-    )
-    ax.set_title(
-        "Стан світла в Києві", fontsize=20, color="white", pad=20, fontweight="bold"
-    )
-
-    legend_labels = [
-        f"Світло є  {stats['on_pct']}%",
-        f"Без світла  {stats['off_pct']}%",
-    ]
-    ax.legend(
-        wedges, legend_labels,
-        loc="lower center", bbox_to_anchor=(0.5, -0.08),
-        fontsize=13, frameon=False, labelcolor="white",
-    )
-
-    plt.tight_layout()
-    buf = BytesIO()
-    plt.savefig(
-        buf, format="png", dpi=120, bbox_inches="tight", facecolor=fig.get_facecolor()
-    )
-    buf.seek(0)
-    plt.close()
-    return buf
-
-
-def format_svitlo_caption(stats) -> str:
-    return (
-        f"💡 Світло є: {stats['on_pct']}% ({stats['on']} з {stats['total']})\n"
-        f"🌑 Без світла: {stats['off_pct']}% ({stats['off']} з {stats['total']})\n\n"
-        f"Київ · svitlobot.in.ua"
-    )
-
-
-# ================== ТРИВОГА + ЦІЛІ ==================
-KIND_UA = {
-    "drone_piston": "Шахед / БпЛА",
-    "drone_jet": "Реактивний БпЛА",
-    "drone_fpv": "FPV",
-    "missile_cruise": "Крилата ракета",
-    "missile_ballistic": "Балістика",
-    "missile": "Ракета",
-    "kab": "КАБ",
-    "aircraft": "Авіація",
-    "recon": "Розвідка",
-    "decoy": "Приманка",
-}
-
-
-def get_kyiv_alert():
-    try:
-        r = requests.get(TRYVOHA_KYIV, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        return {
-            "active": bool(data.get("active")),
-            "level": data.get("level"),
-            "started_at": data.get("started_at"),
-            "name": data.get("name_uk", "м. Київ"),
-        }
-    except Exception as e:
-        logger.error(f"Tryvoha error: {e}")
-        return None
-
-
-def get_nearby_threats() -> str:
-    try:
-        r = requests.get(
-            MAPA_NEARBY,
-            params={"lat": KYIV_LAT, "lon": KYIV_LON, "radius_km": NEARBY_RADIUS_KM},
-            timeout=10,
-        )
-        r.raise_for_status()
-        data = r.json()
-        threats = data.get("threats") or data.get("objects") or []
-        if not threats:
-            return "Цілей у радіусі 20 км не зафіксовано"
-
-        counter = Counter()
-        for t in threats:
-            if t.get("status") and t.get("status") != "active":
-                continue
-            kind = t.get("kind") or t.get("subkind") or "unknown"
-            amount = int(t.get("amount") or 1)
-            counter[kind] += amount
-
-        if not counter:
-            return "Цілей у радіусі 20 км не зафіксовано"
-
-        parts = []
-        for kind, cnt in counter.most_common():
-            label = KIND_UA.get(kind, kind)
-            parts.append(f"{cnt}× {label}")
-        return "Біля Києва (~20 км): " + ", ".join(parts)
-    except Exception as e:
-        logger.error(f"MAPA nearby error: {e}")
-        return ""
-
-
-def level_text(level) -> str:
-    if level == "red":
-        return "червоний"
-    if level == "yellow":
-        return "жовтий"
-    return "невідомий"
-
-
-def level_emoji(level) -> str:
-    if level == "red":
-        return "🔴"
-    if level == "yellow":
-        return "🟡"
-    return "🟠"
-
-
-def now_kyiv_str() -> str:
-    return datetime.now(timezone(timedelta(hours=2))).strftime("%H:%M")
-
-
-def format_alert_start(alert: dict, threats_line: str) -> str:
-    lvl = alert.get("level")
-    text = (
-        f"{level_emoji(lvl)} {now_kyiv_str()} | Київ | Повітряна тривога\n"
-        f"Рівень: {level_text(lvl)}"
-    )
-    if threats_line:
-        text += f"\n\n{threats_line}"
-    text += "\n\nДжерело: tryvoha.online / mapa.ua"
-    return text
-
-
-def format_alert_end(prev_level) -> str:
-    return (
-        f"🟢 {now_kyiv_str()} | Київ | Відбій повітряної тривоги\n"
-        f"Був рівень: {level_text(prev_level)}\n\n"
-        f"Джерело: tryvoha.online"
-    )
-
-
-def format_alert_update(alert: dict, threats_line: str) -> str:
-    lvl = alert.get("level")
-    text = (
-        f"{level_emoji(lvl)} {now_kyiv_str()} | Київ | Зміна рівня тривоги\n"
-        f"Рівень: {level_text(lvl)}"
-    )
-    if threats_line:
-        text += f"\n\n{threats_line}"
-    text += "\n\nДжерело: tryvoha.online / mapa.ua"
-    return text
+async def edit_or_resend(app: Application, msg_id, text: str):
+    """Редагує пост; якщо не вийшло — надсилає новий. Повертає (message_id, чи_створено_новий)."""
+    if msg_id:
+        try:
+            await app.bot.edit_message_text(chat_id=CHAT_ID, message_id=msg_id, text=text)
+            return msg_id, False
+        except BadRequest as e:
+            if "not modified" in str(e).lower():
+                return msg_id, False
+            logger.info(f"Не вдалося відредагувати пост тривоги: {e}")
+        except Exception as e:
+            logger.info(f"Не вдалося відредагувати пост тривоги: {e}")
+    msg = await app.bot.send_message(chat_id=CHAT_ID, text=text, disable_notification=True)
+    return msg.message_id, True
 
 
 # ================== КОМАНДИ ==================
 async def cmd_svitlo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global state
     chat_id = update.effective_chat.id
-
-    now_ts = datetime.now(timezone.utc).timestamp()
+    now_ts = time.time()
     last_ts = state.get("last_svitlo_ts") or 0
     last_mid = state.get("last_svitlo_message_id")
 
@@ -297,147 +130,224 @@ async def cmd_svitlo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.info(f"Не вдалося видалити старе /svitlo: {e}")
 
-    stats = get_svitlobot_stats()
+    stats = await asyncio.to_thread(get_svitlobot_stats)
     if not stats:
-        await update.message.reply_text("Не вдалося отримати дані зі Svitlobot 😔")
+        await update.message.reply_text(
+            "Не вдалося отримати дані зі Svitlobot 😔", disable_notification=True
+        )
         return
 
-    img = create_stats_image(stats)
-    caption = format_svitlo_caption(stats)
     msg = await update.message.reply_photo(
-        photo=InputFile(img, filename="svitlo.png"),
-        caption=caption,
+        photo=InputFile(create_stats_image(stats), filename="svitlo.png"),
+        caption=format_svitlo_caption(stats),
+        disable_notification=True,
     )
-
     state["last_svitlo_message_id"] = msg.message_id
     state["last_svitlo_ts"] = now_ts
     save_state(state)
 
 
-async def cmd_trivoga(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    alert = get_kyiv_alert()
+async def cmd_rayony(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    stats = await asyncio.to_thread(get_svitlobot_stats)
+    if not stats:
+        await update.message.reply_text(
+            "Не вдалося отримати дані зі Svitlobot 😔", disable_notification=True
+        )
+        return
+    await update.message.reply_text(format_districts_full(stats), disable_notification=True)
+
+
+async def cmd_tryvoga(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    alert = await asyncio.to_thread(get_kyiv_alert)
     if alert is None:
-        await update.message.reply_text("Не вдалося перевірити статус тривоги")
+        await update.message.reply_text(
+            "Не вдалося перевірити статус тривоги", disable_notification=True
+        )
         return
 
     if alert["active"]:
-        threats = get_nearby_threats()
-        text = format_alert_start(alert, threats)
+        threats = await asyncio.to_thread(get_nearby_threats)
+        started_ts = state.get("alert_started_ts") or parse_started_at(alert.get("started_at"))
+        text = format_alert_message(alert, threats, started_ts, "status")
     else:
-        text = (
-            f"🟢 {now_kyiv_str()} | Київ | Тривоги немає\n\n"
-            f"Джерело: tryvoha.online"
+        text = f"🟢 {now_kyiv_str()} | Київ | Тривоги немає\n\nДжерело: tryvoha.online"
+    await update.message.reply_text(text, disable_notification=True)
+
+
+async def cmd_dopomoga(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(HELP_TEXT, disable_notification=True)
+
+
+async def cmd_vidnovyty(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Відновлює вчорашній замір з повідомлення бота (відповіддю на пост о 12:05)."""
+    msg = update.message
+    reply = lambda t: msg.reply_text(t, disable_notification=True)  # noqa: E731
+
+    if ADMIN_IDS and (msg.from_user is None or msg.from_user.id not in ADMIN_IDS):
+        await reply("Ця команда лише для адмінів.")
+        return
+
+    src = msg.reply_to_message
+    if src is None:
+        await reply(
+            "Дайте цю команду У ВІДПОВІДЬ на пост бота зі світлом о 12:05 "
+            "(той, що треба взяти як базу для порівняння)."
         )
-    await update.message.reply_text(text)
+        return
+    if src.from_user is None or src.from_user.id != context.bot.id:
+        await reply("Це повідомлення надіслав не бот.")
+        return
 
+    parsed = parse_stats_caption(src.caption or src.text or "")
+    if not parsed:
+        await reply("У цьому повідомленні немає статистики світла.")
+        return
 
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Команди:\n"
-        "/svitlo — статистика світла в Києві\n"
-        "/trivoga — статус повітряної тривоги + цілі поруч\n"
-        "/help — ця підказка\n\n"
-        "Автоматично:\n"
-        "• статистика світла о 00:05, 04:05, 08:05, 12:05, 16:05, 20:05\n"
-        "• сповіщення про початок/зміну/відбій тривоги"
+    dt = src.date.astimezone(KYIV_TZ)
+    if not (dt.hour == 12 and dt.minute < 30):
+        await reply("Потрібен пост о 12:05 — порівняння робиться лише з нього.")
+        return
+
+    day = dt.strftime("%Y-%m-%d")
+    set_daily(day, parsed["on"], parsed["off"])
+    total = parsed["on"] + parsed["off"]
+    await reply(
+        f"✅ Збережено базу за {day}: світло було у {parsed['on']} з {total} "
+        f"({parsed['on'] / total * 100:.1f}%)."
     )
 
 
 # ================== АВТОМАТИКА ==================
-async def send_stats(app: Application):
-    stats = get_svitlobot_stats()
+async def send_stats(app: Application, daily: bool = False):
+    """Планова статистика світла. daily=True (пост о 12:05) — з порівнянням з учора."""
+    stats = await asyncio.to_thread(get_svitlobot_stats)
     if not stats:
         return
-    img = create_stats_image(stats)
-    caption = format_svitlo_caption(stats)
     try:
+        caption = format_svitlo_caption(stats, with_daily=daily)  # дельта — ДО збереження сьогоднішнього
         msg = await app.bot.send_photo(
             chat_id=CHAT_ID,
-            photo=InputFile(img, filename="svitlo.png"),
+            photo=InputFile(create_stats_image(stats), filename="svitlo.png"),
             caption=caption,
+            disable_notification=True,
         )
         state["last_svitlo_message_id"] = msg.message_id
-        state["last_svitlo_ts"] = datetime.now(timezone.utc).timestamp()
-        save_state(state)
+        state["last_svitlo_ts"] = time.time()
+        if daily:
+            set_daily(kyiv_date_str(stats["ts"]), stats["on"], stats["off"])  # зберігає state
+        else:
+            save_state(state)
     except Exception as e:
         logger.error(f"send_stats error: {e}")
 
 
 async def check_alert(app: Application):
-    global state
-
-    alert = get_kyiv_alert()
+    alert = await asyncio.to_thread(get_kyiv_alert)
     if alert is None:
         return
 
-    current_active = alert["active"]
-    current_level = alert.get("level")
+    now_ts = time.time()
+    active = alert["active"]
+    level = alert.get("level")
     prev_active = state.get("last_alert_active", False)
     prev_level = state.get("last_alert_level")
     msg_id = state.get("alert_message_id")
+    started_ts = state.get("alert_started_ts")
 
     try:
-        if current_active and not prev_active:
-            threats = get_nearby_threats()
-            text = format_alert_start(alert, threats)
-            msg = await app.bot.send_message(chat_id=CHAT_ID, text=text)
+        # 1) НОВА тривога: прибрати пост минулої, надіслати й закріпити новий
+        if active and not prev_active:
+            started_ts = parse_started_at(alert.get("started_at")) or now_ts
+            await remove_old_alert_post(app, msg_id)
+            threats = await asyncio.to_thread(get_nearby_threats)
+            text = format_alert_message(alert, threats, started_ts, "start")
+            msg = await app.bot.send_message(chat_id=CHAT_ID, text=text, disable_notification=True)
             state["alert_message_id"] = msg.message_id
+            state["alert_started_ts"] = started_ts
+            state["alert_last_refresh_ts"] = now_ts
+            await pin_silently(app, msg.message_id)
 
-        elif (
-            current_active
-            and prev_active
-            and current_level
-            and current_level != prev_level
-        ):
-            threats = get_nearby_threats()
-            text = format_alert_update(alert, threats)
-            if msg_id:
-                try:
-                    await app.bot.edit_message_text(
-                        chat_id=CHAT_ID, message_id=msg_id, text=text
-                    )
-                except Exception:
-                    msg = await app.bot.send_message(chat_id=CHAT_ID, text=text)
-                    state["alert_message_id"] = msg.message_id
-            else:
-                msg = await app.bot.send_message(chat_id=CHAT_ID, text=text)
-                state["alert_message_id"] = msg.message_id
+        # 2) тривога триває: зміна рівня або планове оновлення цілей (кожні ALERT_REFRESH_MIN хв)
+        elif active and prev_active:
+            if not started_ts:  # стан міг загубитись
+                started_ts = parse_started_at(alert.get("started_at")) or now_ts
+                state["alert_started_ts"] = started_ts
 
-        elif not current_active and prev_active:
-            text = format_alert_end(prev_level)
-            if msg_id:
-                try:
-                    await app.bot.delete_message(chat_id=CHAT_ID, message_id=msg_id)
-                except Exception as e:
-                    logger.info(f"Не вдалося видалити повідомлення тривоги: {e}")
-            await app.bot.send_message(chat_id=CHAT_ID, text=text)
-            state["alert_message_id"] = None
+            level_changed = bool(level) and level != prev_level
+            last_refresh = state.get("alert_last_refresh_ts") or 0
+            refresh_due = (now_ts - last_refresh) >= ALERT_REFRESH_MIN * 60
+
+            if level_changed or refresh_due:
+                threats = await asyncio.to_thread(get_nearby_threats)
+                kind = "update" if level_changed else "refresh"
+                text = format_alert_message(alert, threats, started_ts, kind)
+                new_id, created = await edit_or_resend(app, msg_id, text)
+                state["alert_message_id"] = new_id
+                state["alert_last_refresh_ts"] = now_ts
+                if created:
+                    await pin_silently(app, new_id)
+
+        # 3) відбій: той самий пост стає «Відбій…» і лишається закріпленим до наступної тривоги
+        elif not active and prev_active:
+            text = format_alert_end(prev_level, started_ts, now_ts)
+            new_id, created = await edit_or_resend(app, msg_id, text)
+            state["alert_message_id"] = new_id
+            state["alert_started_ts"] = None
+            state["alert_last_refresh_ts"] = 0
+            if created:
+                await pin_silently(app, new_id)
 
     except Exception as e:
+        # стан last_alert_* НЕ оновлюємо: наступний цикл (через 40 с) спробує знову
         logger.error(f"check_alert error: {e}")
+        save_state(state)
+        return
 
-    state["last_alert_active"] = current_active
-    state["last_alert_level"] = current_level
+    state["last_alert_active"] = active
+    state["last_alert_level"] = level
     save_state(state)
 
 
 # ================== ЗАПУСК ==================
+async def post_init(app: Application):
+    await app.bot.set_my_commands(
+        [
+            BotCommand("svitlo", "Світло в Києві: діаграма і топ-5 районів"),
+            BotCommand("rayony", "Світло по всіх районах"),
+            BotCommand("tryvoga", "Статус повітряної тривоги"),
+            BotCommand("dopomoga", "Що вміє бот"),
+        ]
+    )
+
+    scheduler = AsyncIOScheduler(timezone="Europe/Kyiv")
+    scheduler.add_job(
+        send_stats, "cron", hour="0,4,8,16,20", minute=5, args=[app, False],
+        max_instances=1, coalesce=True,
+    )
+    scheduler.add_job(  # 12:05 — з порівнянням з учора
+        send_stats, "cron", hour=12, minute=5, args=[app, True],
+        max_instances=1, coalesce=True,
+    )
+    scheduler.add_job(
+        check_alert, "interval", seconds=40, args=[app],
+        max_instances=1, coalesce=True,
+    )
+    scheduler.start()
+    app.bot_data["scheduler"] = scheduler
+    logger.info("Планувальник запущено")
+
+
 def main():
     if not TOKEN or not CHAT_ID:
         logger.error("TELEGRAM_TOKEN або TELEGRAM_CHAT_ID не задані!")
         return
 
-    app = Application.builder().token(TOKEN).build()
-
+    app = Application.builder().token(TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("svitlo", cmd_svitlo))
-    app.add_handler(CommandHandler("trivoga", cmd_trivoga))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("start", cmd_help))
-
-    scheduler = AsyncIOScheduler(timezone="Europe/Kyiv")
-    scheduler.add_job(send_stats, "cron", hour="0,4,8,12,16,20", minute=5, args=[app])
-    scheduler.add_job(check_alert, "interval", seconds=40, args=[app])
-    scheduler.start()
+    app.add_handler(CommandHandler("rayony", cmd_rayony))
+    app.add_handler(CommandHandler(["tryvoga", "trivoga", "trevoga"], cmd_tryvoga))
+    app.add_handler(CommandHandler(["dopomoga", "start"], cmd_dopomoga))
+    app.add_handler(CommandHandler("vidnovyty", cmd_vidnovyty))
 
     logger.info("Бот запущено")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
