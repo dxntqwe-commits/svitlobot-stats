@@ -31,22 +31,46 @@ KIND_UA = {
     "decoy": "Приманка",
 }
 
+HEADERS = {
+    "User-Agent": "SvitlobotStats/1.1 (https://github.com/dxntqwe-commits/svitlobot-stats)",
+    "Accept": "application/json",
+}
+
+
+def _get_json(url: str, params=None, retries: int = 3, timeout: int = 12):
+    """Запит з ретраями і нормальним User-Agent."""
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            r = requests.get(url, params=params, headers=HEADERS, timeout=timeout)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            last_err = e
+            logger.warning(f"Запит {url} спроба {attempt}/{retries}: {type(e).__name__}: {e}")
+            if attempt < retries:
+                time.sleep(1.5 * attempt)
+    logger.error(f"Не вдалося отримати {url} після {retries} спроб: {last_err}")
+    return None
+
 
 # ================== ДЖЕРЕЛА ==================
 def get_kyiv_alert():
-    try:
-        r = requests.get(TRYVOHA_KYIV, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        return {
-            "active": bool(data.get("active")),
-            "level": data.get("level"),
-            "started_at": data.get("started_at"),
-            "name": data.get("name_uk", "м. Київ"),
-        }
-    except Exception as e:
-        logger.error(f"Tryvoha error: {e}")
-        return None
+    # Основний + запасний домен
+    urls = [
+        TRYVOHA_KYIV,
+        "https://xn--80adds5ajn.online/api/v1/alerts/kyiv",
+    ]
+    for url in urls:
+        data = _get_json(url)
+        if data:
+            return {
+                "active": bool(data.get("active")),
+                "level": data.get("level"),
+                "started_at": data.get("started_at"),
+                "name": data.get("name_uk", "м. Київ"),
+            }
+    return None
 
 
 def _num(value):
@@ -134,47 +158,42 @@ _sample_logged = False
 def get_nearby_threats():
     """Повертає {"summary": str, "details": [str]} або None, якщо джерело недоступне."""
     global _sample_logged
-    try:
-        r = requests.get(
-            MAPA_NEARBY,
-            params={"lat": KYIV_LAT, "lon": KYIV_LON, "radius_km": NEARBY_RADIUS_KM},
-            timeout=10,
-        )
-        r.raise_for_status()
-        data = r.json()
-        threats = data.get("threats") or data.get("objects") or []
-
-        if threats and not _sample_logged:
-            # Один раз пишемо в лог реальну структуру цілі — щоб підігнати опис під API.
-            logger.info("mapa.ua зразок цілі: %s", threats[0])
-            _sample_logged = True
-
-        active = [
-            t for t in threats
-            if isinstance(t, dict) and not (t.get("status") and t.get("status") != "active")
-        ]
-        if not active:
-            return {"summary": f"Цілей у радіусі {NEARBY_RADIUS_KM} км не зафіксовано", "details": []}
-
-        counter = Counter()
-        for t in active:
-            counter[t.get("kind") or t.get("subkind") or "unknown"] += _amount(t)
-        summary = f"Біля Києва (~{NEARBY_RADIUS_KM} км): " + ", ".join(
-            f"{cnt}× {KIND_UA.get(kind, kind)}" for kind, cnt in counter.most_common()
-        )
-
-        rows = [_threat_line(t) for t in active]
-        details = []
-        if any(has_extra for _, _, has_extra in rows):  # інакше це просто дубль summary
-            rows.sort(key=lambda x: (x[1] is None, x[1] or 0))  # найближчі зверху
-            lines = [line for line, _, _ in rows]
-            details = lines[:MAX_THREAT_LINES]
-            if len(lines) > MAX_THREAT_LINES:
-                details.append(f"… і ще {len(lines) - MAX_THREAT_LINES}")
-        return {"summary": summary, "details": details}
-    except Exception as e:
-        logger.error(f"MAPA nearby error: {e}")
+    data = _get_json(
+        MAPA_NEARBY,
+        params={"lat": KYIV_LAT, "lon": KYIV_LON, "radius_km": NEARBY_RADIUS_KM},
+    )
+    if not data:
         return None
+
+    threats = data.get("threats") or data.get("objects") or []
+
+    if threats and not _sample_logged:
+        logger.info("mapa.ua зразок цілі: %s", threats[0])
+        _sample_logged = True
+
+    active = [
+        t for t in threats
+        if isinstance(t, dict) and not (t.get("status") and t.get("status") != "active")
+    ]
+    if not active:
+        return {"summary": f"Цілей у радіусі {NEARBY_RADIUS_KM} км не зафіксовано", "details": []}
+
+    counter = Counter()
+    for t in active:
+        counter[t.get("kind") or t.get("subkind") or "unknown"] += _amount(t)
+    summary = f"Біля Києва (~{NEARBY_RADIUS_KM} км): " + ", ".join(
+        f"{cnt}× {KIND_UA.get(kind, kind)}" for kind, cnt in counter.most_common()
+    )
+
+    rows = [_threat_line(t) for t in active]
+    details = []
+    if any(has_extra for _, _, has_extra in rows):
+        rows.sort(key=lambda x: (x[1] is None, x[1] or 0))
+        lines = [line for line, _, _ in rows]
+        details = lines[:MAX_THREAT_LINES]
+        if len(lines) > MAX_THREAT_LINES:
+            details.append(f"… і ще {len(lines) - MAX_THREAT_LINES}")
+    return {"summary": summary, "details": details}
 
 
 # ================== ФОРМАТУВАННЯ ==================
