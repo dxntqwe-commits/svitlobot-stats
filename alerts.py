@@ -40,7 +40,7 @@ KIND_UA = {
 }
 
 HEADERS = {
-    "User-Agent": "SvitlobotStats/1.6 (https://github.com/dxntqwe-commits/svitlobot-stats)",
+    "User-Agent": "SvitlobotStats/1.7 (https://github.com/dxntqwe-commits/svitlobot-stats)",
     "Accept": "application/json",
 }
 
@@ -189,6 +189,50 @@ def _format_threat_line(t: dict) -> str:
     return line
 
 
+def format_threats_compact(threats: list) -> dict:
+    """Короткий формат, якщо цілей багато."""
+    if not threats:
+        return {"summary": "Цілей не зафіксовано", "details": []}
+
+    total = len(threats)
+    counter = Counter(t["kind"] for t in threats)
+    summary = f"Всього {total} цілей: " + ", ".join(
+        f"{cnt}× {KIND_UA.get(k, k)}" for k, cnt in counter.most_common()
+    )
+
+    near = []
+    oblast = []
+    for t in threats:
+        if t.get("lat") and t.get("lon") and not t.get("area_only"):
+            dist = distance_km(KYIV_LAT, KYIV_LON, t["lat"], t["lon"])
+            if dist <= 30:
+                near.append((dist, t))
+            else:
+                oblast.append((dist, t))
+        else:
+            oblast.append((999, t))
+
+    near.sort(key=lambda x: x[0])
+    oblast.sort(key=lambda x: x[0])
+
+    lines = []
+    if near:
+        lines.append(f"🛩️ Біля Києва (~30 км): {len(near)}")
+        for _, t in near[:5]:
+            lines.append(_format_threat_line(t))
+        if len(near) > 5:
+            lines.append(f"… і ще {len(near) - 5} біля Києва")
+
+    if oblast:
+        lines.append(f"📍 В області: {len(oblast)}")
+        for _, t in oblast[:4]:
+            lines.append(_format_threat_line(t))
+        if len(oblast) > 4:
+            lines.append(f"… і ще {len(oblast) - 4} в області")
+
+    return {"summary": summary, "details": lines, "source": "neptun"}
+
+
 def get_nearby_threats():
     data = _get_json(NEPTUN_THREATS)
     if data and data.get("threats"):
@@ -201,6 +245,10 @@ def get_nearby_threats():
             if dist <= NEARBY_RADIUS_KM:
                 t["_dist"] = dist
                 nearby.append(t)
+
+        if len(nearby) > 15:
+            return format_threats_compact(nearby)
+
         if nearby:
             nearby.sort(key=lambda x: x["_dist"])
             counter = Counter()
@@ -221,6 +269,8 @@ def get_nearby_threats():
     active = [_threat_from_mapa(t) for t in threats if isinstance(t, dict) and (not t.get("status") or t.get("status") == "active")]
     if not active:
         return {"summary": f"Цілей у радіусі {NEARBY_RADIUS_KM} км не зафіксовано", "details": [], "source": "mapa"}
+    if len(active) > 15:
+        return format_threats_compact(active)
     lines = [_format_threat_line(t) for t in active[:MAX_THREAT_LINES]]
     counter = Counter(t["kind"] for t in active)
     summary = f"Біля Києва (~{NEARBY_RADIUS_KM} км): " + ", ".join(
@@ -245,6 +295,9 @@ def get_kyiv_oblast_threats():
 
     if not matched:
         return {"summary": "Цілей по Києву та Київській області не зафіксовано", "details": [], "source": "neptun"}
+
+    if len(matched) > 15:
+        return format_threats_compact(matched)
 
     lines = [_format_threat_line(t) for t in matched[:MAX_THREAT_LINES]]
     if len(matched) > MAX_THREAT_LINES:
