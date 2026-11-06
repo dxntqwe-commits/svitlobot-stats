@@ -48,6 +48,7 @@ HELP_TEXT = (
     "/rayony — світло по всіх районах\n"
     "/tryvoga — статус тривоги і цілі поруч\n"
     "/tsili — цілі по Києву та Київській області\n"
+    "/update — оновити цілі в закріпленому пості\n"
     "/dopomoga — ця довідка\n\n"
     "Автоматично: статистика світла о 00:05, 04:05, 08:05, 12:05, 16:05, 20:05; "
     "тривога перевіряється кожні 40 секунд.\n\n"
@@ -161,6 +162,36 @@ async def cmd_tsili(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, disable_notification=True)
 
 
+async def cmd_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Примусово оновити закріплене повідомлення про тривогу."""
+    alert = await asyncio.to_thread(get_kyiv_alert)
+    if alert is None:
+        await update.message.reply_text("Не вдалося перевірити тривогу", disable_notification=True)
+        return
+
+    msg_id = state.get("alert_message_id")
+    if not msg_id:
+        await update.message.reply_text("Немає активного поста тривоги для оновлення", disable_notification=True)
+        return
+
+    started_ts = state.get("alert_started_ts")
+    threats = await asyncio.to_thread(get_nearby_threats)
+    text = format_alert_message(alert, threats, started_ts, "refresh")
+
+    try:
+        await context.bot.edit_message_text(
+            chat_id=CHAT_ID,
+            message_id=msg_id,
+            text=text,
+        )
+        state["alert_last_refresh_ts"] = time.time()
+        save_state(state)
+        await update.message.reply_text("✅ Оновлено", disable_notification=True)
+    except Exception as e:
+        logger.error(f"cmd_update error: {e}")
+        await update.message.reply_text("Не вдалося оновити повідомлення", disable_notification=True)
+
+
 async def cmd_dopomoga(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(HELP_TEXT, disable_notification=True)
 
@@ -271,6 +302,7 @@ async def post_init(app: Application):
         BotCommand("rayony", "Світло по всіх районах"),
         BotCommand("tryvoga", "Статус повітряної тривоги"),
         BotCommand("tsili", "Цілі по Києву та Київській області"),
+        BotCommand("update", "Оновити цілі в закріпленому пості"),
         BotCommand("dopomoga", "Що вміє бот"),
     ])
     scheduler = AsyncIOScheduler(timezone="Europe/Kyiv")
@@ -291,6 +323,7 @@ def main():
     app.add_handler(CommandHandler("rayony", cmd_rayony))
     app.add_handler(CommandHandler(["tryvoga", "trivoga", "trevoga"], cmd_tryvoga))
     app.add_handler(CommandHandler("tsili", cmd_tsili))
+    app.add_handler(CommandHandler("update", cmd_update))
     app.add_handler(CommandHandler(["dopomoga", "start"], cmd_dopomoga))
     app.add_handler(CommandHandler("vidnovyty", cmd_vidnovyty))
     logger.info("Бот запущено")
