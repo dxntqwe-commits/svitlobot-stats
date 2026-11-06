@@ -1,1 +1,257 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SVITLO • KYIV</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body {
+      background: #09090b;
+      color: #fafafa;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    .card {
+      background: #18181b;
+      border: 1px solid #27272a;
+    }
+  </style>
+</head>
+<body class="min-h-screen p-4 md:p-6">
+  <div class="max-w-3xl mx-auto">
+    <!-- Header -->
+    <div class="flex justify-between items-end mb-6">
+      <div>
+        <h1 class="text-3xl md:text-4xl font-bold tracking-tight">SVITLO</h1>
+        <p class="text-zinc-500 text-sm mt-0.5">Київ • Live</p>
+      </div>
+      <div id="time" class="text-zinc-400 font-mono text-sm"></div>
+    </div>
 
+    <!-- Alert -->
+    <div class="card rounded-2xl p-5 mb-4 flex items-center gap-4">
+      <div id="alert-dot" class="w-3.5 h-3.5 rounded-full bg-green-500 shrink-0"></div>
+      <div class="flex-1">
+        <div id="alert-title" class="text-xl md:text-2xl font-semibold text-green-400">Тривоги немає</div>
+        <div id="alert-sub" class="text-zinc-500 text-xs mt-0.5">Оновлено щойно</div>
+      </div>
+    </div>
+
+    <!-- Light -->
+    <div class="card rounded-2xl p-5 mb-4">
+      <div class="flex items-center justify-between mb-3">
+        <h2 class="text-lg font-semibold text-yellow-400">⚡ Світло по районах</h2>
+      </div>
+      <div id="light-summary" class="text-zinc-400 text-xs mb-4"></div>
+      <div id="districts" class="space-y-2.5"></div>
+    </div>
+
+    <!-- Threats -->
+    <div class="card rounded-2xl p-5">
+      <h2 class="text-lg font-semibold mb-3">🎯 Цілі біля Києва</h2>
+      <div id="threats" class="space-y-2"></div>
+    </div>
+  </div>
+
+  <script>
+    const KYIV_BOUNDS = { latMin: 50.20, latMax: 50.60, lonMin: 30.20, lonMax: 30.85 };
+
+    const DISTRICTS = {
+      "Голосіївський": [50.39, 30.52],
+      "Дарницький": [50.40, 30.63],
+      "Деснянський": [50.53, 30.60],
+      "Дніпровський": [50.45, 30.60],
+      "Оболонський": [50.50, 30.50],
+      "Печерський": [50.43, 30.55],
+      "Подільський": [50.47, 30.48],
+      "Святошинський": [50.46, 30.37],
+      "Солом'янський": [50.43, 30.45],
+      "Шевченківський": [50.46, 30.50]
+    };
+
+    const KYIV_OBLAST_KEYWORDS = [
+      "київ", "київська", "обухів", "біла церква", "бровари", "бориспіль", "ірпінь",
+      "буча", "вишгород", "фастів", "васильків", "українка", "богуслав", "яготин",
+      "сквира", "кагарлик", "миронівка", "ржищів", "славутич", "переяслав"
+    ];
+
+    function isKyivOblast(threat) {
+      const loc = ((threat.locality || threat.place || threat.region || "") + " " + (threat.description || "")).toLowerCase();
+      return KYIV_OBLAST_KEYWORDS.some(k => loc.includes(k));
+    }
+
+    function classifyDistrict(lat, lon) {
+      let best = null;
+      let bestDist = Infinity;
+      for (const [name, [dLat, dLon]] of Object.entries(DISTRICTS)) {
+        const dist = Math.hypot(lat - dLat, lon - dLon);
+        if (dist < bestDist) {
+          bestDist = dist;
+          best = name;
+        }
+      }
+      return bestDist < 0.08 ? best : null;
+    }
+
+    function getThreatType(t) {
+      const type = (t.type || t.kind || "").toString().toLowerCase();
+      if (type.includes("shahed") || type.includes("герань") || type.includes("geran")) return "Шахед";
+      if (type.includes("lancet")) return "Ланцет";
+      if (type.includes("orlan")) return "Орлан";
+      if (type.includes("supercam")) return "Суперкам";
+      if (type.includes("zala")) return "Зала";
+      if (type.includes("missile") || type.includes("ракета") || type.includes("крилата")) return "Ракета";
+      if (type.includes("ballistic") || type.includes("балістична")) return "Балістична";
+      if (type.includes("uav") || type.includes("бпла") || type.includes("дрон") || type.includes("безпілот")) return "БпЛА";
+      return t.type || "БпЛА";
+    }
+
+    async function fetchLightData() {
+      try {
+        const res = await fetch("https://api.svitlobot.in.ua/website/getChannelsForMap");
+        const text = await res.text();
+        const districts = {};
+        let on = 0, off = 0;
+
+        for (const line of text.split("\n")) {
+          const parts = line.split(";&&&;");
+          if (parts.length < 8) continue;
+
+          const status = parts[1]?.trim();
+          const lat = parseFloat(parts[6]);
+          const lon = parseFloat(parts[7]);
+
+          if (isNaN(lat) || isNaN(lon)) continue;
+          if (lat < KYIV_BOUNDS.latMin || lat > KYIV_BOUNDS.latMax ||
+              lon < KYIV_BOUNDS.lonMin || lon > KYIV_BOUNDS.lonMax) continue;
+
+          if (status !== "1" && status !== "2") continue;
+
+          const district = classifyDistrict(lat, lon);
+          if (!district) continue;
+
+          if (!districts[district]) districts[district] = { on: 0, off: 0 };
+          if (status === "1") {
+            districts[district].on++;
+            on++;
+          } else {
+            districts[district].off++;
+            off++;
+          }
+        }
+
+        return { districts, on, off, total: on + off };
+      } catch {
+        return null;
+      }
+    }
+
+    async function fetchAlert() {
+      try {
+        const res = await fetch("https://tryvoha.online/api/v1/alerts/kyiv");
+        return await res.json();
+      } catch {
+        return { active: false };
+      }
+    }
+
+    async function fetchThreats() {
+      try {
+        const res = await fetch("https://neptun.in.ua/api/v1/threats");
+        const data = await res.json();
+        const all = data.threats || [];
+        return all.filter(isKyivOblast).slice(0, 15);
+      } catch {
+        return [];
+      }
+    }
+
+    function renderDistricts(data) {
+      const container = document.getElementById("districts");
+      const summary = document.getElementById("light-summary");
+
+      if (!data || data.total === 0) {
+        container.innerHTML = `<div class="text-zinc-500 text-sm">Немає даних</div>`;
+        summary.textContent = "";
+        return;
+      }
+
+      summary.textContent = `Всього ${data.total} · Світло є ${data.on} · Немає ${data.off}`;
+
+      const entries = Object.entries(data.districts)
+        .map(([name, d]) => ({
+          name: name.replace("ський", ""),
+          pct: Math.round(100 * d.on / (d.on + d.off || 1)),
+          total: d.on + d.off
+        }))
+        .sort((a, b) => b.pct - a.pct);
+
+      container.innerHTML = entries.map(e => {
+        const color = e.pct >= 60 ? "bg-green-500" : e.pct >= 30 ? "bg-yellow-500" : "bg-red-500";
+        return `
+          <div class="flex items-center gap-3 text-sm">
+            <div class="w-28 shrink-0 text-zinc-300">${e.name}</div>
+            <div class="flex-1 h-2 bg-zinc-800 rounded-full overflow-hidden">
+              <div class="${color} h-full rounded-full transition-all duration-500" style="width: ${e.pct}%"></div>
+            </div>
+            <div class="w-10 text-right font-medium tabular-nums">${e.pct}%</div>
+          </div>
+        `;
+      }).join("");
+    }
+
+    function renderThreats(threats) {
+      const container = document.getElementById("threats");
+      if (!threats || threats.length === 0) {
+        container.innerHTML = `<div class="text-zinc-500 text-sm">Цілей не виявлено</div>`;
+        return;
+      }
+
+      container.innerHTML = threats.map(t => {
+        const count = t.count || 1;
+        const type = getThreatType(t);
+        const loc = t.locality || t.place || "Область";
+        const heading = t.heading ? ` → ${Math.round(t.heading)}°` : "";
+        return `
+          <div class="flex justify-between items-start py-1.5 border-b border-zinc-800 last:border-0">
+            <div class="font-medium">${count}× ${type}</div>
+            <div class="text-right text-xs text-zinc-400 max-w-[55%]">
+              ${loc}${heading}
+            </div>
+          </div>
+        `;
+      }).join("");
+    }
+
+    async function update() {
+      const now = new Date().toLocaleTimeString("uk-UA", { timeZone: "Europe/Kyiv", hour12: false });
+      document.getElementById("time").textContent = now;
+
+      const alert = await fetchAlert();
+      const title = document.getElementById("alert-title");
+      const dot = document.getElementById("alert-dot");
+      const sub = document.getElementById("alert-sub");
+
+      if (alert.active) {
+        title.textContent = "Повітряна тривога";
+        title.className = "text-xl md:text-2xl font-semibold text-red-400";
+        dot.className = "w-3.5 h-3.5 rounded-full bg-red-500 shrink-0";
+      } else {
+        title.textContent = "Тривоги немає";
+        title.className = "text-xl md:text-2xl font-semibold text-green-400";
+        dot.className = "w-3.5 h-3.5 rounded-full bg-green-500 shrink-0";
+      }
+      sub.textContent = "Оновлено: " + now;
+
+      const light = await fetchLightData();
+      renderDistricts(light);
+
+      const threats = await fetchThreats();
+      renderThreats(threats);
+    }
+
+    update();
+    setInterval(update, 10000);
+  </script>
+</body>
+</html>
