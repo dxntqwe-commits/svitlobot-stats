@@ -1,5 +1,5 @@
 """Тривога: джерела, опис цілей, форматування повідомлень.
-Основне джерело цілей — NEPTUN, тривоги по Києву — tryvoha (точніше для міста).
+Основне джерело цілей — NEPTUN, тривоги по Києву — tryvoha.
 """
 import logging
 import time
@@ -40,7 +40,7 @@ KIND_UA = {
 }
 
 HEADERS = {
-    "User-Agent": "SvitlobotStats/1.4 (https://github.com/dxntqwe-commits/svitlobot-stats)",
+    "User-Agent": "SvitlobotStats/1.5 (https://github.com/dxntqwe-commits/svitlobot-stats)",
     "Accept": "application/json",
 }
 
@@ -62,8 +62,6 @@ def _get_json(url: str, params=None, retries: int = 3, timeout: int = 12):
 
 
 def get_kyiv_alert():
-    """Тривога саме по місту Київ. Спочатку tryvoha (точніше), потім NEPTUN."""
-    # tryvoha — краще для міста
     data = _get_json(TRYVOHA_KYIV)
     if data:
         return {
@@ -74,12 +72,10 @@ def get_kyiv_alert():
             "source": "tryvoha",
         }
 
-    # Fallback: NEPTUN — тільки якщо є саме місто, а не райони області
     data = _get_json(NEPTUN_ALERTS)
     if data:
         for item in data.get("oblasts", []) + data.get("raions", []):
             name = (item.get("name") or "").lower()
-            # Тільки точне місто Київ, не «Київська область» і не райони
             if name in ("київ", "м. київ", "місто київ"):
                 return {
                     "active": True,
@@ -107,6 +103,16 @@ def _threat_from_neptun(t: dict):
     speed = None
     if isinstance(t.get("velocity"), dict):
         speed = t["velocity"].get("speedKmh")
+
+    sources = int(t.get("sourceCount") or 1)
+    conf = (t.get("confidenceLevel") or t.get("displayConfidence") or "medium").lower()
+    if conf == "high" or sources >= 8:
+        prob = min(95, 70 + sources * 3)
+    elif conf == "low" or sources <= 2:
+        prob = max(25, 20 + sources * 8)
+    else:
+        prob = min(80, 40 + sources * 6)
+
     return {
         "kind": kind,
         "amount": amount,
@@ -118,6 +124,7 @@ def _threat_from_neptun(t: dict):
         "region": t.get("region") or "",
         "explanation": t.get("explanationShort") or "",
         "area_only": bool(t.get("areaOnly")),
+        "prob": prob,
         "source": "neptun",
     }
 
@@ -134,42 +141,40 @@ def _threat_from_mapa(t: dict):
         "region": t.get("region") or "",
         "explanation": "",
         "area_only": False,
+        "prob": 60,
         "source": "mapa",
     }
 
 
 def _format_threat_line(t: dict) -> str:
-    """Чіткий формат: кількість × тип — населений пункт / область, курс, швидкість."""
     label = KIND_UA.get(t["kind"], t["kind"])
-    parts = []
+    amount = t["amount"]
 
-    # Де
+    where_parts = []
     if t.get("locality"):
-        parts.append(t["locality"])
-    if t.get("region") and t["region"] not in (t.get("locality") or ""):
-        parts.append(t["region"])
-    where = ", ".join(parts) if parts else "координати невідомі"
+        where_parts.append(t["locality"])
+    if t.get("region"):
+        where_parts.append(t["region"])
+    where = ", ".join(where_parts) if where_parts else "невідомо"
 
-    extras = []
-    if t.get("lat") is not None and t.get("lon") is not None and not t.get("area_only"):
-        dist = distance_km(KYIV_LAT, KYIV_LON, t["lat"], t["lon"])
-        side = compass(bearing_deg(KYIV_LAT, KYIV_LON, t["lat"], t["lon"]))
-        extras.append(f"~{dist:.0f} км {side}")
+    direction = ""
     if t.get("heading") is not None:
-        extras.append(f"курс {compass(t['heading'])}")
-    if t.get("speed"):
-        extras.append(f"{int(t['speed'])} км/год")
+        direction = compass(t["heading"])
+    elif t.get("lat") is not None and t.get("lon") is not None and not t.get("area_only"):
+        direction = compass(bearing_deg(KYIV_LAT, KYIV_LON, t["lat"], t["lon"]))
 
-    line = f"• {t['amount']}× {label} — {where}"
-    if extras:
-        line += " (" + ", ".join(extras) + ")"
-    if t.get("explanation"):
-        line += f"\n  {t['explanation']}"
+    speed_str = f"{int(t['speed'])} км/год" if t.get("speed") else "—"
+    prob = t.get("prob", 50)
+
+    line = f"• {amount}× {label}"
+    line += f" — {where}"
+    if direction:
+        line += f" → {direction}"
+    line += f" | {speed_str} | {prob}%"
     return line
 
 
 def get_nearby_threats():
-    """Цілі біля Києва (радіус)."""
     data = _get_json(NEPTUN_THREATS)
     if data and data.get("threats"):
         normalized = [_threat_from_neptun(t) for t in data["threats"] if t.get("status") == "active"]
@@ -194,7 +199,6 @@ def get_nearby_threats():
                 lines.append(f"… і ще {len(nearby) - MAX_THREAT_LINES}")
             return {"summary": summary, "details": lines, "source": "neptun"}
 
-    # Fallback mapa
     data = _get_json(MAPA_NEARBY, params={"lat": KYIV_LAT, "lon": KYIV_LON, "radius_km": NEARBY_RADIUS_KM})
     if not data:
         return None
@@ -211,7 +215,6 @@ def get_nearby_threats():
 
 
 def get_kyiv_oblast_threats():
-    """Цілі по Києву та Київській області (по назві)."""
     data = _get_json(NEPTUN_THREATS)
     if not data or not data.get("threats"):
         return None
