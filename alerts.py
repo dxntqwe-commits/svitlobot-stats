@@ -40,7 +40,7 @@ KIND_UA = {
 }
 
 HEADERS = {
-    "User-Agent": "SvitlobotStats/1.5 (https://github.com/dxntqwe-commits/svitlobot-stats)",
+    "User-Agent": "SvitlobotStats/1.6 (https://github.com/dxntqwe-commits/svitlobot-stats)",
     "Accept": "application/json",
 }
 
@@ -150,6 +150,21 @@ def _format_threat_line(t: dict) -> str:
     label = KIND_UA.get(t["kind"], t["kind"])
     amount = t["amount"]
 
+    kind_emoji = {
+        "uav": "🛩️",
+        "drone_piston": "🛩️",
+        "drone_jet": "🛩️",
+        "drone_fpv": "🛩️",
+        "missile": "🚀",
+        "missile_cruise": "🚀",
+        "missile_ballistic": "🚀",
+        "ballistic": "🚀",
+        "kab": "💣",
+        "recon": "📡",
+        "aircraft": "✈️",
+        "mig31k": "✈️",
+    }.get(t["kind"], "❓")
+
     where_parts = []
     if t.get("locality"):
         where_parts.append(t["locality"])
@@ -166,7 +181,7 @@ def _format_threat_line(t: dict) -> str:
     speed_str = f"{int(t['speed'])} км/год" if t.get("speed") else "—"
     prob = t.get("prob", 50)
 
-    line = f"• {amount}× {label}"
+    line = f"{kind_emoji} {amount}× {label}"
     line += f" — {where}"
     if direction:
         line += f" → {direction}"
