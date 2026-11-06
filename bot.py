@@ -146,7 +146,7 @@ async def cmd_tryvoga(update: Update, context: ContextTypes.DEFAULT_TYPE):
         started_ts = state.get("alert_started_ts") or parse_started_at(alert.get("started_at"))
         text = format_alert_message(alert, threats, started_ts, "status")
     else:
-        text = f"{now_kyiv_str()} | Київ | Тривоги немає\n\nДані: NEPTUN / tryvoha.online"
+        text = f"🟢 {now_kyiv_str()} | Київ | Тривоги немає\n\nДані: NEPTUN / tryvoha.online"
     await update.message.reply_text(text, disable_notification=True)
 
 
@@ -158,12 +158,11 @@ async def cmd_tsili(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = result["summary"]
     if result.get("details"):
         text += "\n" + "\n".join(result["details"])
-    text += "\n\nДані: NEPTUN (neptun.in.ua)"
+    text += "\n\n📡 Дані: NEPTUN (neptun.in.ua)"
     await update.message.reply_text(text, disable_notification=True)
 
 
 async def cmd_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Примусово оновити закріплене повідомлення про тривогу."""
     alert = await asyncio.to_thread(get_kyiv_alert)
     if alert is None:
         await update.message.reply_text("Не вдалося перевірити тривогу", disable_notification=True)
