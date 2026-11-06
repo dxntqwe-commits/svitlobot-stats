@@ -5,9 +5,9 @@ import logging
 import time
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from telegram import BotCommand, InputFile, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
 from telegram.error import BadRequest
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
 from alerts import (
     format_alert_end,
@@ -36,29 +36,25 @@ logger = logging.getLogger(__name__)
 HELP_TEXT = (
     "🤖 Svitlobot Stats — бот про світло та повітряну тривогу в Києві\n\n"
     "Що вміє:\n"
-    "💡 Показує, скільки датчиків Світлобота в Києві зараз зі світлом, "
-    "і називає райони, де гірше за все (топ-5).\n"
-    "📊 Щодня о 12:05 порівнює світло з учорашнім.\n"
-    "🚨 Повідомляє про початок, зміну рівня та відбій повітряної тривоги; "
-    "під час тривоги оновлює цілі навколо міста.\n"
-    "📌 Закріплює пост про останню тривогу.\n"
-    "🔕 Усі повідомлення без звуку.\n\n"
+    "💡 Показує статистику світла по Києву та районах\n"
+    "🚨 Повідомляє про повітряну тривогу та цілі біля Києва\n"
+    "📌 Закріплює живий пост про ситуацію\n"
+    "🔕 Усі повідомлення без звуку\n\n"
     "Команди:\n"
     "/svitlo — світло по місту\n"
-    "/rayony — світло по всіх районах\n"
-    "/tryvoga — статус тривоги і цілі поруч\n"
-    "/tsili — цілі по Києву та Київській області\n"
-    "/update — оновити цілі в закріпленому пості\n"
+    "/rayony — світло по районах\n"
+    "/tryvoga — статус тривоги\n"
+    "/tsili — цілі по Києву та області\n"
+    "/status — створити/оновити закріплений живий пост\n"
     "/dopomoga — ця довідка\n\n"
-    "Автоматично: статистика світла о 00:05, 04:05, 08:05, 12:05, 16:05, 20:05; "
-    "тривога перевіряється кожні 40 секунд.\n\n"
-    "Дякуємо джерелам даних:\n"
-    "• NEPTUN (neptun.in.ua) — цілі та тривоги\n"
-    "• mapa.ua — запасне джерело цілей\n"
-    "• tryvoha.online — запасне джерело тривог\n"
-    "• Svitlobot (svitlobot.in.ua) — дані про світло\n\n"
-    "Для адмінів: /vidnovyty — відновлення бази порівняння."
+    "Дякуємо джерелам: NEPTUN, tryvoha.online, mapa.ua, Svitlobot"
 )
+
+
+def alert_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Оновити", callback_data="update_alert")]
+    ])
 
 
 async def pin_silently(app: Application, message_id: int):
@@ -90,20 +86,31 @@ async def remove_old_alert_post(app: Application, msg_id):
             pass
 
 
-async def edit_or_resend(app: Application, msg_id, text: str):
+async def edit_or_resend(app: Application, msg_id, text: str, keyboard=None):
     if msg_id:
         try:
-            await app.bot.edit_message_text(chat_id=CHAT_ID, message_id=msg_id, text=text)
+            await app.bot.edit_message_text(
+                chat_id=CHAT_ID,
+                message_id=msg_id,
+                text=text,
+                reply_markup=keyboard,
+            )
             return msg_id, False
         except BadRequest as e:
             if "not modified" in str(e).lower():
                 return msg_id, False
         except Exception:
             pass
-    msg = await app.bot.send_message(chat_id=CHAT_ID, text=text, disable_notification=True)
+    msg = await app.bot.send_message(
+        chat_id=CHAT_ID,
+        text=text,
+        disable_notification=True,
+        reply_markup=keyboard,
+    )
     return msg.message_id, True
 
 
+# ================== КОМАНДИ ==================
 async def cmd_svitlo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     now_ts = time.time()
@@ -147,7 +154,7 @@ async def cmd_tryvoga(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = format_alert_message(alert, threats, started_ts, "status")
     else:
         text = f"🟢 {now_kyiv_str()} | Київ | Тривоги немає\n\nДані: NEPTUN / tryvoha.online"
-    await update.message.reply_text(text, disable_notification=True)
+    await update.message.reply_text(text, disable_notification=True, reply_markup=alert_keyboard())
 
 
 async def cmd_tsili(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -162,33 +169,37 @@ async def cmd_tsili(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, disable_notification=True)
 
 
-async def cmd_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Створює або оновлює закріплений живий пост про ситуацію."""
     alert = await asyncio.to_thread(get_kyiv_alert)
     if alert is None:
         await update.message.reply_text("Не вдалося перевірити тривогу", disable_notification=True)
         return
 
     msg_id = state.get("alert_message_id")
-    if not msg_id:
-        await update.message.reply_text("Немає активного поста тривоги для оновлення", disable_notification=True)
-        return
-
     started_ts = state.get("alert_started_ts")
-    threats = await asyncio.to_thread(get_nearby_threats)
-    text = format_alert_message(alert, threats, started_ts, "refresh")
 
-    try:
-        await context.bot.edit_message_text(
-            chat_id=CHAT_ID,
-            message_id=msg_id,
-            text=text,
+    if alert["active"]:
+        threats = await asyncio.to_thread(get_nearby_threats)
+        text = format_alert_message(alert, threats, started_ts, "status")
+    else:
+        text = (
+            f"🟢 {now_kyiv_str()} | Київ | Тривоги немає\n\n"
+            "Живий статус оновлюється автоматично.\n"
+            "Дані: NEPTUN / tryvoha.online"
         )
-        state["alert_last_refresh_ts"] = time.time()
-        save_state(state)
+
+    new_id, created = await edit_or_resend(context.application, msg_id, text, alert_keyboard())
+    state["alert_message_id"] = new_id
+    if alert["active"] and not started_ts:
+        state["alert_started_ts"] = parse_started_at(alert.get("started_at")) or time.time()
+    save_state(state)
+
+    if created:
+        await pin_silently(context.application, new_id)
+        await update.message.reply_text("📌 Закріплено живий пост", disable_notification=True)
+    else:
         await update.message.reply_text("✅ Оновлено", disable_notification=True)
-    except Exception as e:
-        logger.error(f"cmd_update error: {e}")
-        await update.message.reply_text("Не вдалося оновити повідомлення", disable_notification=True)
 
 
 async def cmd_dopomoga(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -218,6 +229,33 @@ async def cmd_vidnovyty(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# ================== КНОПКА ОНОВЛЕННЯ ==================
+async def on_update_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    alert = await asyncio.to_thread(get_kyiv_alert)
+    if alert is None:
+        await query.answer("Не вдалося перевірити", show_alert=True)
+        return
+
+    started_ts = state.get("alert_started_ts")
+    if alert["active"]:
+        threats = await asyncio.to_thread(get_nearby_threats)
+        text = format_alert_message(alert, threats, started_ts, "refresh")
+    else:
+        text = f"🟢 {now_kyiv_str()} | Київ | Тривоги немає\n\nДані: NEPTUN / tryvoha.online"
+
+    try:
+        await query.edit_message_text(text=text, reply_markup=alert_keyboard())
+        state["alert_last_refresh_ts"] = time.time()
+        save_state(state)
+    except Exception as e:
+        logger.error(f"update button: {e}")
+        await query.answer("Помилка оновлення", show_alert=True)
+
+
+# ================== АВТОМАТИКА ==================
 async def send_stats(app: Application, daily: bool = False):
     stats = await asyncio.to_thread(get_svitlobot_stats)
     if not stats:
@@ -244,6 +282,7 @@ async def check_alert(app: Application):
     alert = await asyncio.to_thread(get_kyiv_alert)
     if alert is None:
         return
+
     now_ts = time.time()
     active = alert["active"]
     level = alert.get("level")
@@ -251,17 +290,24 @@ async def check_alert(app: Application):
     prev_level = state.get("last_alert_level")
     msg_id = state.get("alert_message_id")
     started_ts = state.get("alert_started_ts")
+
     try:
         if active and not prev_active:
             started_ts = parse_started_at(alert.get("started_at")) or now_ts
             await remove_old_alert_post(app, msg_id)
             threats = await asyncio.to_thread(get_nearby_threats)
             text = format_alert_message(alert, threats, started_ts, "start")
-            msg = await app.bot.send_message(chat_id=CHAT_ID, text=text, disable_notification=True)
+            msg = await app.bot.send_message(
+                chat_id=CHAT_ID,
+                text=text,
+                disable_notification=True,
+                reply_markup=alert_keyboard(),
+            )
             state["alert_message_id"] = msg.message_id
             state["alert_started_ts"] = started_ts
             state["alert_last_refresh_ts"] = now_ts
             await pin_silently(app, msg.message_id)
+
         elif active and prev_active:
             if not started_ts:
                 started_ts = parse_started_at(alert.get("started_at")) or now_ts
@@ -273,43 +319,47 @@ async def check_alert(app: Application):
                 threats = await asyncio.to_thread(get_nearby_threats)
                 kind = "update" if level_changed else "refresh"
                 text = format_alert_message(alert, threats, started_ts, kind)
-                new_id, created = await edit_or_resend(app, msg_id, text)
+                new_id, created = await edit_or_resend(app, msg_id, text, alert_keyboard())
                 state["alert_message_id"] = new_id
                 state["alert_last_refresh_ts"] = now_ts
                 if created:
                     await pin_silently(app, new_id)
+
         elif not active and prev_active:
             text = format_alert_end(prev_level, started_ts, now_ts)
-            new_id, created = await edit_or_resend(app, msg_id, text)
+            new_id, created = await edit_or_resend(app, msg_id, text, alert_keyboard())
             state["alert_message_id"] = new_id
             state["alert_started_ts"] = None
             state["alert_last_refresh_ts"] = 0
             if created:
                 await pin_silently(app, new_id)
+
     except Exception as e:
         logger.error(f"check_alert error: {e}")
         save_state(state)
         return
+
     state["last_alert_active"] = active
     state["last_alert_level"] = level
     save_state(state)
 
 
+# ================== ЗАПУСК ==================
 async def post_init(app: Application):
     await app.bot.set_my_commands([
-        BotCommand("svitlo", "Світло в Києві: діаграма і топ-5 районів"),
-        BotCommand("rayony", "Світло по всіх районах"),
-        BotCommand("tryvoga", "Статус повітряної тривоги"),
-        BotCommand("tsili", "Цілі по Києву та Київській області"),
-        BotCommand("update", "Оновити цілі в закріпленому пості"),
-        BotCommand("dopomoga", "Що вміє бот"),
+        BotCommand("svitlo", "Світло в Києві"),
+        BotCommand("rayony", "Світло по районах"),
+        BotCommand("tryvoga", "Статус тривоги"),
+        BotCommand("tsili", "Цілі по Києву та області"),
+        BotCommand("status", "Живий закріплений пост"),
+        BotCommand("dopomoga", "Довідка"),
     ])
+
     scheduler = AsyncIOScheduler(timezone="Europe/Kyiv")
     scheduler.add_job(send_stats, "cron", hour="0,4,8,16,20", minute=5, args=[app, False], max_instances=1, coalesce=True)
     scheduler.add_job(send_stats, "cron", hour=12, minute=5, args=[app, True], max_instances=1, coalesce=True)
-    scheduler.add_job(check_alert, "interval", seconds=40, args=[app], max_instances=1, coalesce=True)
+    scheduler.add_job(check_alert, "interval", seconds=18, args=[app], max_instances=1, coalesce=True)
     scheduler.start()
-    app.bot_data["scheduler"] = scheduler
     logger.info("Планувальник запущено")
 
 
@@ -317,14 +367,17 @@ def main():
     if not TOKEN or not CHAT_ID:
         logger.error("TELEGRAM_TOKEN або TELEGRAM_CHAT_ID не задані!")
         return
+
     app = Application.builder().token(TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("svitlo", cmd_svitlo))
     app.add_handler(CommandHandler("rayony", cmd_rayony))
     app.add_handler(CommandHandler(["tryvoga", "trivoga", "trevoga"], cmd_tryvoga))
     app.add_handler(CommandHandler("tsili", cmd_tsili))
-    app.add_handler(CommandHandler("update", cmd_update))
+    app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler(["dopomoga", "start"], cmd_dopomoga))
     app.add_handler(CommandHandler("vidnovyty", cmd_vidnovyty))
+    app.add_handler(CallbackQueryHandler(on_update_button, pattern="^update_alert$"))
+
     logger.info("Бот запущено")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
