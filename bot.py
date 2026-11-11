@@ -448,40 +448,58 @@ async def check_alert(app: Application):
 
 
 async def check_yasno_schedule(app: Application):
-    """Перевіряє оновлення графіків Yasno і надсилає картинку (зі звуком)."""
+    """Перевіряє оновлення графіків Yasno.
+    Надсилає тільки коли:
+    - з'явився графік на завтра
+    - або реально змінилися інтервали відключень
+    """
     schedule = await asyncio.to_thread(fetch_yasno_schedule)
     if not schedule:
         return
 
-    # Беремо updatedOn з першої групи
-    first_group = next(iter(schedule.values()), {})
-    updated = first_group.get("updatedOn")
-    if not updated:
-        return
+    # Хеш поточного графіка (інтервали), щоб не слати при кожній зміні timestamp
+    def schedule_hash(day: str) -> str:
+        parts = []
+        for grp in sorted(schedule.keys()):
+            slots = schedule[grp].get(day, {}).get("slots", [])
+            for s in slots:
+                if s.get("type") == "Definite":
+                    parts.append(f"{grp}:{s['start']}-{s['end']}")
+        return "|".join(parts)
 
-    last_updated = state.get("last_yasno_updated")
+    today_hash = schedule_hash("today")
+    tomorrow_hash = schedule_hash("tomorrow")
+
+    last_today_hash = state.get("last_yasno_today_hash")
+    last_tomorrow_hash = state.get("last_yasno_tomorrow_hash")
+
+    # Чи є взагалі графік на завтра (не WaitingForSchedule)
     tomorrow_info = next((g.get("tomorrow", {}) for g in schedule.values() if g.get("tomorrow")), {})
-    tomorrow_date = tomorrow_info.get("date", "")[:10] if tomorrow_info else None
     tomorrow_status = tomorrow_info.get("status", "")
-    last_tomorrow = state.get("last_yasno_tomorrow_date")
+    has_tomorrow = bool(tomorrow_status and tomorrow_status != "WaitingForSchedule" and tomorrow_hash)
 
-    # Надсилаємо якщо:
-    # 1) з'явився графік на завтра (статус не WaitingForSchedule)
-    # 2) або оновився поточний графік і ми ще не надсилали сьогодні
     should_send = False
     day_to_send = "today"
     reason = ""
 
-    if tomorrow_status and tomorrow_status != "WaitingForSchedule" and tomorrow_date and tomorrow_date != last_tomorrow:
+    # 1. З'явився графік на завтра
+    if has_tomorrow and tomorrow_hash != last_tomorrow_hash:
         should_send = True
         day_to_send = "tomorrow"
-        reason = f"графік на завтра ({tomorrow_date})"
-    elif updated != last_updated:
+        reason = "з'явився графік на завтра"
+
+    # 2. Змінились інтервали на сьогодні (і ми вже колись щось слали)
+    elif last_today_hash and today_hash != last_today_hash:
         should_send = True
         day_to_send = "today"
-        reason = "оновлення графіка"
+        reason = "змінились інтервали на сьогодні"
 
     if not should_send:
+        # Все одно зберігаємо хеші, щоб не слати при першому запуску
+        state["last_yasno_today_hash"] = today_hash
+        if has_tomorrow:
+            state["last_yasno_tomorrow_hash"] = tomorrow_hash
+        save_state(state)
         return
 
     try:
@@ -491,11 +509,11 @@ async def check_yasno_schedule(app: Application):
             chat_id=CHAT_ID,
             photo=InputFile(img, filename=f"yasno_{day_to_send}.png"),
             caption=caption[:1024],
-            disable_notification=False,  # зі звуком
+            disable_notification=False,
         )
-        state["last_yasno_updated"] = updated
-        if day_to_send == "tomorrow" and tomorrow_date:
-            state["last_yasno_tomorrow_date"] = tomorrow_date
+        state["last_yasno_today_hash"] = today_hash
+        if has_tomorrow:
+            state["last_yasno_tomorrow_hash"] = tomorrow_hash
         save_state(state)
         logger.info(f"Sent Yasno schedule: {reason}")
     except Exception as e:
