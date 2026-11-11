@@ -623,64 +623,74 @@ def _minutes_to_hhmm(m: int) -> str:
 
 
 def create_yasno_image(schedule: dict, day: str = "today") -> BytesIO:
-    """Генерує чисту картинку з графіками всіх груп."""
+    """Генерує картинку: темна палітра, інтервали зверху над смугами."""
     groups = sorted(schedule.keys(), key=lambda x: (int(x.split(".")[0]), x))
     n = len(groups)
 
-    # Більше місця по висоті, щоб текст не наїжджав
-    fig, ax = plt.subplots(figsize=(16, max(16, n * 0.55)), facecolor=BG)
-    ax.set_facecolor(BG)
+    cols = 2
+    rows_per_col = (n + cols - 1) // cols
+
+    fig = plt.figure(figsize=(16, 24), facecolor="#1a1a2e")
+    fig.suptitle("КИЇВ · Графік відключень", fontsize=20, fontweight="bold",
+                 color="white", y=0.985, ha="center")
 
     day_label = "Сьогодні" if day == "today" else "Завтра"
-    fig.text(0.5, 0.99, f"Графік відключень · Київ · {day_label}",
-             ha="center", va="top", color="white", fontsize=20, fontweight="bold")
+    fig.text(0.97, 0.975, day_label, ha="right", va="top", fontsize=13,
+             color="#b0bec5")
 
-    y_positions = list(range(n - 1, -1, -1))
+    for col in range(cols):
+        start = col * rows_per_col
+        end = min(start + rows_per_col, n)
+        col_groups = groups[start:end]
 
-    for y, grp in zip(y_positions, groups):
-        info = schedule[grp].get(day, {})
-        slots = info.get("slots", [])
+        ax = fig.add_axes([0.05 + col * 0.47, 0.03, 0.42, 0.91])
+        ax.set_facecolor("#1a1a2e")
+        ax.set_xlim(0, 24)
+        ax.set_ylim(-0.4, len(col_groups) - 0.6)
+        ax.invert_yaxis()
+        ax.set_yticks([])
+        ax.set_xticks([0, 6, 12, 18, 24])
+        ax.set_xticklabels(["00", "06", "12", "18", "24"], fontsize=8, color="#90a4ae")
+        ax.tick_params(axis="x", length=0, pad=3)
+        for spine in ax.spines.values():
+            spine.set_visible(False)
 
-        # Фон (світло є)
-        ax.barh(y, 24, height=0.42, left=0, color="#2a2a45", zorder=1)
+        for i, grp in enumerate(col_groups):
+            info = schedule[grp].get(day, {})
+            slots = info.get("slots", [])
 
-        # Відключення
-        intervals = []
-        for s in slots:
-            if s.get("type") == "Definite":
-                start_h = s["start"] / 60.0
-                end_h = s["end"] / 60.0
-                ax.barh(y, end_h - start_h, height=0.42, left=start_h,
-                        color="#e53935", zorder=2)
-                intervals.append(f"{_minutes_to_hhmm(s['start'])}–{_minutes_to_hhmm(s['end'])}")
+            # Фон
+            ax.barh(i, 24, height=0.38, left=0, color="#2a2a45", zorder=1)
 
-        # Група зліва
-        ax.text(-1.8, y, grp, ha="right", va="center", color="white",
-                fontsize=11, fontweight="bold")
+            intervals = []
+            for s in slots:
+                if s.get("type") == "Definite":
+                    start_h = s["start"] / 60.0
+                    end_h = s["end"] / 60.0
+                    ax.barh(i, end_h - start_h, height=0.38, left=start_h,
+                            color="#ef5350", zorder=2)
+                    intervals.append(f"{_minutes_to_hhmm(s['start'])}–{_minutes_to_hhmm(s['end'])}")
 
-        # Інтервали справа від бару, рівно
-        if intervals:
-            text = " · ".join(intervals)
-            ax.text(24.6, y, text, ha="left", va="center",
-                    color="#b0bec5", fontsize=8.5)
+            # Група зліва
+            ax.text(-1.5, i, grp, ha="right", va="center", fontsize=10,
+                    fontweight="bold", color="white")
 
-        # Години без світла ще правіше
-        off_min = sum(s["end"] - s["start"] for s in slots if s.get("type") == "Definite")
-        off_h = round(off_min / 60, 1)
-        ax.text(38.5, y, f"{off_h} год", ha="left", va="center",
-                color="#90a4ae", fontsize=9)
+            # Інтервали зверху над смугою
+            if intervals:
+                text = " · ".join(intervals)
+                ax.text(0.2, i - 0.32, text, ha="left", va="bottom",
+                        fontsize=6.8, color="#cfd8dc")
 
-    ax.set_xlim(-3.5, 42)
-    ax.set_ylim(-0.6, n - 0.4)
-    ax.set_yticks([])
-    ax.set_xticks(range(0, 25, 3))
-    ax.set_xticklabels([f"{h:02d}" for h in range(0, 25, 3)], color="#cfd8dc", fontsize=11)
-    ax.tick_params(axis="x", colors="#546e7a", length=0, pad=6)
-    for spine in ax.spines.values():
-        spine.set_visible(False)
+            # Години без світла справа
+            off_min = sum(s["end"] - s["start"] for s in slots if s.get("type") == "Definite")
+            off_h = round(off_min / 60, 1)
+            ax.text(24.5, i, f"{off_h} год", ha="left", va="center",
+                    fontsize=8, color="#90a4ae")
 
-    fig.text(0.5, 0.005, "Дякуємо Yasno · yasno.com.ua · тільки Київ",
-             ha="center", color="#78909c", fontsize=11)
+        ax.set_xlim(-3.2, 28)
+
+    fig.text(0.5, 0.008, "Дякуємо Yasno · yasno.com.ua · тільки Київ",
+             ha="center", fontsize=10, color="#78909c")
 
     buf = BytesIO()
     fig.savefig(buf, format="png", dpi=130, bbox_inches="tight", facecolor=fig.get_facecolor())
