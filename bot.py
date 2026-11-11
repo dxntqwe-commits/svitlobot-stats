@@ -325,11 +325,15 @@ async def cmd_doba(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not hist:
         await update.message.reply_text("Не вдалося отримати історію 😔", disable_notification=True)
         return
-    await update.message.reply_photo(
-        photo=InputFile(create_24h_image(hist), filename="svitlo_24h.png"),
-        caption=format_24h_caption(hist)[:1024],
-        disable_notification=True,
-    )
+    try:
+        await update.message.reply_photo(
+            photo=InputFile(create_24h_image(hist), filename="svitlo_24h.png"),
+            caption=format_24h_caption(hist)[:1024],
+            disable_notification=True,
+        )
+    except Exception as e:
+        logger.error(f"cmd_doba error: {e}")
+        await update.message.reply_text("Помилка при формуванні статистики за 24 год 😔", disable_notification=True)
 
 
 async def cmd_tyzhden(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -338,30 +342,15 @@ async def cmd_tyzhden(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not hist:
         await update.message.reply_text("Не вдалося отримати історію 😔", disable_notification=True)
         return
-    await update.message.reply_photo(
-        photo=InputFile(create_week_image(hist), filename="svitlo_week.png"),
-        caption=format_week_caption(hist)[:1024],
-        disable_notification=True,
-    )
-    stats = await asyncio.to_thread(get_svitlobot_stats)
-    if not stats:
-        return
     try:
-        caption = format_svitlo_caption(stats, with_daily=daily)
-        msg = await app.bot.send_photo(
-            chat_id=CHAT_ID,
-            photo=InputFile(create_stats_image(stats), filename="svitlo.png"),
-            caption=caption,
+        await update.message.reply_photo(
+            photo=InputFile(create_week_image(hist), filename="svitlo_week.png"),
+            caption=format_week_caption(hist)[:1024],
             disable_notification=True,
         )
-        state["last_svitlo_message_id"] = msg.message_id
-        state["last_svitlo_ts"] = time.time()
-        if daily:
-            set_daily(kyiv_date_str(stats["ts"]), stats["on"], stats["off"])
-        else:
-            save_state(state)
     except Exception as e:
-        logger.error(f"send_stats error: {e}")
+        logger.error(f"cmd_tyzhden error: {e}")
+        await update.message.reply_text("Помилка при формуванні тижневої статистики 😔", disable_notification=True)
 
 
 async def check_alert(app: Application):
