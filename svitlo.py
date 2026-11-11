@@ -275,3 +275,326 @@ def parse_stats_caption(text: str):
     if total <= 0 or on > total:
         return None
     return {"on": on, "off": total - on}
+
+
+# ================== ІСТОРІЯ (24г / 7д) ==================
+from config import HISTORY_API
+
+def _get_kyiv_channel_keys() -> set:
+    """Повертає множину channel_key, які знаходяться в bounding box Києва."""
+    try:
+        r = requests.get(SVITLOBOT_API, timeout=20)
+        r.raise_for_status()
+        keys = set()
+        for line in r.text.strip().splitlines():
+            parts = line.rstrip(";").split(";&&&;")
+            if len(parts) < 8:
+                continue
+            try:
+                lat = float(parts[6])
+                lng = float(parts[7])
+                key = parts[4].strip()
+            except (ValueError, IndexError):
+                continue
+            if 50.20 <= lat <= 50.60 and 30.20 <= lng <= 30.85 and key:
+                keys.add(key)
+        return keys
+    except Exception as e:
+        logger.error(f"Kyiv keys error: {e}")
+        return set()
+
+
+def _fetch_history(range_: str) -> dict | None:
+    try:
+        r = requests.get(f"{HISTORY_API}?range={range_}", timeout=60)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        logger.error(f"History {range_} error: {e}")
+        return None
+
+
+def _expand_timeline(arr: list, total_minutes: int) -> list:
+    """Перетворює [status, minutes, status, minutes, ...] на список статусів по хвилинах."""
+    if not arr:
+        return []
+    timeline = []
+    i = 0
+    while i < len(arr) and len(timeline) < total_minutes:
+        status = arr[i]
+        minutes = arr[i + 1] if i + 1 < len(arr) else (total_minutes - len(timeline))
+        minutes = min(int(minutes), total_minutes - len(timeline))
+        if minutes > 0:
+            timeline.extend([status] * minutes)
+        i += 2
+    # добиваємо якщо треба
+    if len(timeline) < total_minutes and timeline:
+        timeline.extend([timeline[-1]] * (total_minutes - len(timeline)))
+    return timeline[:total_minutes]
+
+
+def compute_kyiv_history(range_: str = "24h", sample_every_min: int = 30) -> dict | None:
+    """
+    Рахує агреговану статистику по Києву за період.
+    Повертає dict з samples (список % on), avg/min/max, і для 7d — по днях і годинах.
+    """
+    kyiv_keys = _get_kyiv_channel_keys()
+    if not kyiv_keys:
+        return None
+
+    data = _fetch_history(range_)
+    if not data or "c" not in data:
+        return None
+
+    from_ts = data["from"]
+    to_ts = data["to"]
+    total_min = int((to_ts - from_ts) / 60)
+    if total_min <= 0:
+        return None
+
+    # Збираємо таймлайни тільки київських каналів
+    timelines = []
+    for key, arr in data["c"].items():
+        if key not in kyiv_keys:
+            continue
+        tl = _expand_timeline(arr, total_min)
+        if tl:
+            timelines.append(tl)
+
+    if not timelines:
+        return None
+
+    # Семпли кожні sample_every_min хвилин
+    samples = []
+    for minute in range(0, total_min, sample_every_min):
+        on = 0
+        total = 0
+        for tl in timelines:
+            if minute < len(tl):
+                status = tl[minute]
+                if status in (1, 2):  # 1=on, 2=off; ігноруємо техперерви
+                    total += 1
+                    if status == 1:
+                        on += 1
+        if total > 0:
+            samples.append({
+                "minute": minute,
+                "ts": from_ts + minute * 60,
+                "on_pct": round(on / total * 100, 1),
+                "total": total,
+            })
+
+    if not samples:
+        return None
+
+    pcts = [s["on_pct"] for s in samples]
+    result = {
+        "range": range_,
+        "from_ts": from_ts,
+        "to_ts": to_ts,
+        "samples": samples,
+        "avg_pct": round(sum(pcts) / len(pcts), 1),
+        "min_pct": min(pcts),
+        "max_pct": max(pcts),
+        "num_channels": len(timelines),
+    }
+
+    # Завжди рахуємо години (для 24h і для 7d)
+    from collections import defaultdict
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    KYIV_TZ = ZoneInfo("Europe/Kyiv")
+
+    by_hour = defaultdict(list)
+    for s in samples:
+        dt = datetime.fromtimestamp(s["ts"], tz=KYIV_TZ)
+        by_hour[dt.hour].append(s["on_pct"])
+
+    hour_avgs = []
+    for h in range(24):
+        pcts_h = by_hour.get(h, [])
+        hour_avgs.append({
+            "hour": h,
+            "avg_pct": round(sum(pcts_h) / len(pcts_h), 1) if pcts_h else 0,
+        })
+    result["hours"] = hour_avgs
+
+    # Для тижня — додатково по днях
+    if range_ == "7d":
+        by_day = defaultdict(list)
+        for s in samples:
+            dt = datetime.fromtimestamp(s["ts"], tz=KYIV_TZ)
+            day_key = dt.strftime("%Y-%m-%d")
+            by_day[day_key].append(s["on_pct"])
+
+        day_avgs = []
+        for day, pcts_d in sorted(by_day.items()):
+            day_avgs.append({
+                "date": day,
+                "avg_pct": round(sum(pcts_d) / len(pcts_d), 1),
+            })
+        result["days"] = day_avgs
+
+        if day_avgs:
+            best = max(day_avgs, key=lambda x: x["avg_pct"])
+            worst = min(day_avgs, key=lambda x: x["avg_pct"])
+            result["best_day"] = best
+            result["worst_day"] = worst
+
+    return result
+
+
+def create_24h_image(hist: dict) -> BytesIO:
+    samples = hist["samples"]
+    fig = plt.figure(figsize=(12, 7), facecolor=BG)
+    gs = fig.add_gridspec(2, 1, height_ratios=[1.2, 1], hspace=0.35)
+
+    # Верх — динаміка за 24 год
+    ax1 = fig.add_subplot(gs[0])
+    ax1.set_facecolor(BG)
+    xs = [s["minute"] / 60 for s in samples]
+    ys = [s["on_pct"] for s in samples]
+    ax1.fill_between(xs, ys, color="#00c853", alpha=0.35)
+    ax1.plot(xs, ys, color="#00c853", linewidth=2.2)
+    ax1.axhline(hist["avg_pct"], color="#ffab00", linestyle="--", linewidth=1, alpha=0.8)
+    ax1.set_xlim(0, 24)
+    ax1.set_ylim(0, 100)
+    ax1.set_xlabel("Години тому", color="white", fontsize=11)
+    ax1.set_ylabel("% зі світлом", color="white", fontsize=11)
+    ax1.tick_params(colors="white")
+    for spine in ax1.spines.values():
+        spine.set_color("#444")
+    ax1.set_title("Динаміка за останні 24 години", color="white", fontsize=13)
+
+    # Низ — по годинах доби
+    ax2 = fig.add_subplot(gs[1])
+    ax2.set_facecolor(BG)
+    hours = hist.get("hours", [])
+    if hours:
+        hs = [h["hour"] for h in hours]
+        hp = [h["avg_pct"] for h in hours]
+        colors = ["#00c853" if p >= hist["avg_pct"] else "#ff1744" for p in hp]
+        ax2.bar(hs, hp, color=colors, width=0.7, alpha=0.9)
+        ax2.set_xlim(-0.5, 23.5)
+        ax2.set_ylim(0, 100)
+        ax2.set_xlabel("Година доби (Київ)", color="white", fontsize=11)
+        ax2.set_ylabel("% зі світлом", color="white", fontsize=11)
+        ax2.set_xticks(range(0, 24, 2))
+        ax2.tick_params(colors="white")
+        for spine in ax2.spines.values():
+            spine.set_color("#444")
+        ax2.set_title("Коли більше / менше світла (середнє по годинах)", color="white", fontsize=13)
+
+    title = f"Київ · 24 год · середнє {hist['avg_pct']}% (мін {hist['min_pct']}% / макс {hist['max_pct']}%)"
+    fig.text(0.5, 0.98, title, ha="center", va="top", color="white", fontsize=14, fontweight="bold")
+    fig.text(0.5, 0.01, "svitlobot.in.ua · тільки датчики в Києві", ha="center", color="#9e9e9e", fontsize=10)
+
+    buf = BytesIO()
+    fig.savefig(buf, format="png", dpi=110, bbox_inches="tight", facecolor=fig.get_facecolor())
+    buf.seek(0)
+    plt.close(fig)
+    return buf
+
+
+def create_week_image(hist: dict) -> BytesIO:
+    fig = plt.figure(figsize=(14, 7), facecolor=BG)
+    gs = fig.add_gridspec(2, 1, height_ratios=[1, 1], hspace=0.35)
+
+    # Верх — по днях
+    ax1 = fig.add_subplot(gs[0])
+    ax1.set_facecolor(BG)
+    days = hist.get("days", [])
+    if days:
+        labels = [d["date"][5:] for d in days]  # MM-DD
+        pcts = [d["avg_pct"] for d in days]
+        colors = ["#00c853" if p >= hist["avg_pct"] else "#ff1744" for p in pcts]
+        ax1.bar(labels, pcts, color=colors, width=0.6)
+        ax1.axhline(hist["avg_pct"], color="#ffab00", linestyle="--", linewidth=1)
+        ax1.set_ylim(0, 100)
+        ax1.set_ylabel("% зі світлом", color="white")
+        ax1.tick_params(colors="white")
+        for spine in ax1.spines.values():
+            spine.set_color("#444")
+        ax1.set_title("Середній % світла по днях", color="white", fontsize=13)
+
+    # Низ — по годинах
+    ax2 = fig.add_subplot(gs[1])
+    ax2.set_facecolor(BG)
+    hours = hist.get("hours", [])
+    if hours:
+        hs = [h["hour"] for h in hours]
+        hp = [h["avg_pct"] for h in hours]
+        ax2.bar(hs, hp, color="#00c853", width=0.7, alpha=0.85)
+        ax2.set_xlim(-0.5, 23.5)
+        ax2.set_ylim(0, 100)
+        ax2.set_xlabel("Година доби (Київ)", color="white")
+        ax2.set_ylabel("% зі світлом", color="white")
+        ax2.set_xticks(range(0, 24, 2))
+        ax2.tick_params(colors="white")
+        for spine in ax2.spines.values():
+            spine.set_color("#444")
+        ax2.set_title("Коли в Києві частіше є світло (середнє за тиждень)", color="white", fontsize=13)
+
+    best = hist.get("best_day", {})
+    worst = hist.get("worst_day", {})
+    footer = f"Найкращий день: {best.get('date', '?')} ({best.get('avg_pct', 0)}%) · Найгірший: {worst.get('date', '?')} ({worst.get('avg_pct', 0)}%) · svitlobot.in.ua"
+    fig.text(0.5, 0.01, footer, ha="center", color="#9e9e9e", fontsize=10)
+
+    buf = BytesIO()
+    fig.savefig(buf, format="png", dpi=110, bbox_inches="tight", facecolor=fig.get_facecolor())
+    buf.seek(0)
+    plt.close(fig)
+    return buf
+
+
+def format_24h_caption(hist: dict) -> str:
+    hours = hist.get("hours", [])
+    best_hours = sorted([h for h in hours if h["avg_pct"] > 0], key=lambda x: x["avg_pct"], reverse=True)[:3]
+    worst_hours = sorted([h for h in hours if h["avg_pct"] > 0], key=lambda x: x["avg_pct"])[:3]
+
+    lines = [
+        "📊 Київ · останні 24 години",
+        "",
+        f"💡 Середнє: {hist['avg_pct']}% датчиків зі світлом",
+        f"📈 Максимум: {hist['max_pct']}%",
+        f"📉 Мінімум: {hist['min_pct']}%",
+        f"🔢 Датчиків: {hist['num_channels']}",
+        "",
+        "🕐 Коли світла було більше:",
+    ]
+    for h in best_hours:
+        lines.append(f"  • {h['hour']:02d}:00 — {h['avg_pct']}%")
+    lines.append("")
+    lines.append("🌑 Коли світла було менше:")
+    for h in worst_hours:
+        lines.append(f"  • {h['hour']:02d}:00 — {h['avg_pct']}%")
+    lines.append("")
+    lines.append(f"🕐 {ts_kyiv_str(hist['to_ts'])} · svitlobot.in.ua")
+    return "\n".join(lines)
+
+
+def format_week_caption(hist: dict) -> str:
+    best = hist.get("best_day", {})
+    worst = hist.get("worst_day", {})
+    hours = hist.get("hours", [])
+    best_hours = sorted(hours, key=lambda x: x["avg_pct"], reverse=True)[:3]
+    worst_hours = sorted(hours, key=lambda x: x["avg_pct"])[:3]
+
+    lines = [
+        "📊 Київ · тижнева статистика",
+        "",
+        f"💡 Середнє за тиждень: {hist['avg_pct']}%",
+        f"✅ Найкращий день: {best.get('date', '?')} — {best.get('avg_pct', 0)}%",
+        f"❌ Найгірший день: {worst.get('date', '?')} — {worst.get('avg_pct', 0)}%",
+        "",
+        "🕐 Години, коли світло є частіше:",
+    ]
+    for h in best_hours:
+        lines.append(f"  • {h['hour']:02d}:00 — {h['avg_pct']}%")
+    lines.append("")
+    lines.append("🌑 Години, коли світла частіше немає:")
+    for h in worst_hours:
+        lines.append(f"  • {h['hour']:02d}:00 — {h['avg_pct']}%")
+    lines.append("")
+    lines.append(f"🕐 {ts_kyiv_str(hist['to_ts'])} · svitlobot.in.ua")
+    return "\n".join(lines)

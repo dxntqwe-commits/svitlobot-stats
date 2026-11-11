@@ -20,9 +20,14 @@ from config import ADMIN_IDS, ALERT_REFRESH_MIN, CHAT_ID, KYIV_TZ, SVITLO_COOLDO
 from storage import save_state, set_daily, state
 from svitlo import (
     create_stats_image,
+    create_24h_image,
+    create_week_image,
     format_districts_full,
     format_svitlo_caption,
+    format_24h_caption,
+    format_week_caption,
     get_svitlobot_stats,
+    compute_kyiv_history,
     parse_stats_caption,
 )
 from timeutils import kyiv_date_str, now_kyiv_str, parse_started_at
@@ -43,6 +48,8 @@ HELP_TEXT = (
     "Команди:\n"
     "/svitlo — світло по місту\n"
     "/rayony — світло по районах\n"
+    "/doba — статистика за останні 24 години\n"
+    "/tyzhden — тижнева статистика\n"
     "/tryvoga — статус тривоги\n"
     "/tsili — цілі по Києву та області\n"
     "/status — створити/оновити закріплений живий пост\n"
@@ -278,6 +285,85 @@ async def send_stats(app: Application, daily: bool = False):
         logger.error(f"send_stats error: {e}")
 
 
+async def send_24h_stats(app: Application):
+    """Щоденний підсумок за 24 години о 11:00."""
+    hist = await asyncio.to_thread(compute_kyiv_history, "24h", 30)
+    if not hist:
+        return
+    try:
+        caption = format_24h_caption(hist)
+        await app.bot.send_photo(
+            chat_id=CHAT_ID,
+            photo=InputFile(create_24h_image(hist), filename="svitlo_24h.png"),
+            caption=caption[:1024],
+            disable_notification=True,
+        )
+    except Exception as e:
+        logger.error(f"send_24h_stats error: {e}")
+
+
+async def send_week_stats(app: Application):
+    """Тижневий підсумок о 11:30 по понеділках."""
+    hist = await asyncio.to_thread(compute_kyiv_history, "7d", 60)
+    if not hist:
+        return
+    try:
+        caption = format_week_caption(hist)
+        await app.bot.send_photo(
+            chat_id=CHAT_ID,
+            photo=InputFile(create_week_image(hist), filename="svitlo_week.png"),
+            caption=caption[:1024],
+            disable_notification=True,
+        )
+    except Exception as e:
+        logger.error(f"send_week_stats error: {e}")
+
+
+async def cmd_doba(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /doba — статистика за останні 24 год."""
+    hist = await asyncio.to_thread(compute_kyiv_history, "24h", 30)
+    if not hist:
+        await update.message.reply_text("Не вдалося отримати історію 😔", disable_notification=True)
+        return
+    await update.message.reply_photo(
+        photo=InputFile(create_24h_image(hist), filename="svitlo_24h.png"),
+        caption=format_24h_caption(hist)[:1024],
+        disable_notification=True,
+    )
+
+
+async def cmd_tyzhden(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /tyzhden — статистика за останні 7 днів."""
+    hist = await asyncio.to_thread(compute_kyiv_history, "7d", 60)
+    if not hist:
+        await update.message.reply_text("Не вдалося отримати історію 😔", disable_notification=True)
+        return
+    await update.message.reply_photo(
+        photo=InputFile(create_week_image(hist), filename="svitlo_week.png"),
+        caption=format_week_caption(hist)[:1024],
+        disable_notification=True,
+    )
+    stats = await asyncio.to_thread(get_svitlobot_stats)
+    if not stats:
+        return
+    try:
+        caption = format_svitlo_caption(stats, with_daily=daily)
+        msg = await app.bot.send_photo(
+            chat_id=CHAT_ID,
+            photo=InputFile(create_stats_image(stats), filename="svitlo.png"),
+            caption=caption,
+            disable_notification=True,
+        )
+        state["last_svitlo_message_id"] = msg.message_id
+        state["last_svitlo_ts"] = time.time()
+        if daily:
+            set_daily(kyiv_date_str(stats["ts"]), stats["on"], stats["off"])
+        else:
+            save_state(state)
+    except Exception as e:
+        logger.error(f"send_stats error: {e}")
+
+
 async def check_alert(app: Application):
     alert = await asyncio.to_thread(get_kyiv_alert)
     if alert is None:
@@ -349,6 +435,8 @@ async def post_init(app: Application):
     await app.bot.set_my_commands([
         BotCommand("svitlo", "Світло в Києві"),
         BotCommand("rayony", "Світло по районах"),
+        BotCommand("doba", "Статистика за 24 години"),
+        BotCommand("tyzhden", "Тижнева статистика"),
         BotCommand("tryvoga", "Статус тривоги"),
         BotCommand("tsili", "Цілі по Києву та області"),
         BotCommand("status", "Живий закріплений пост"),
@@ -358,6 +446,10 @@ async def post_init(app: Application):
     scheduler = AsyncIOScheduler(timezone="Europe/Kyiv")
     scheduler.add_job(send_stats, "cron", hour="0,4,8,16,20", minute=5, args=[app, False], max_instances=1, coalesce=True)
     scheduler.add_job(send_stats, "cron", hour=12, minute=5, args=[app, True], max_instances=1, coalesce=True)
+    # Нове: щоденний підсумок за 24г о 11:00
+    scheduler.add_job(send_24h_stats, "cron", hour=11, minute=0, args=[app], max_instances=1, coalesce=True)
+    # Тижневий підсумок по понеділках о 11:30
+    scheduler.add_job(send_week_stats, "cron", day_of_week="mon", hour=11, minute=30, args=[app], max_instances=1, coalesce=True)
     scheduler.add_job(check_alert, "interval", seconds=18, args=[app], max_instances=1, coalesce=True)
     scheduler.start()
     logger.info("Планувальник запущено")
@@ -376,6 +468,8 @@ def main():
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler(["dopomoga", "start"], cmd_dopomoga))
     app.add_handler(CommandHandler("vidnovyty", cmd_vidnovyty))
+    app.add_handler(CommandHandler("doba", cmd_doba))
+    app.add_handler(CommandHandler("tyzhden", cmd_tyzhden))
     app.add_handler(CallbackQueryHandler(on_update_button, pattern="^update_alert$"))
 
     logger.info("Бот запущено")
