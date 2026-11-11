@@ -16,6 +16,8 @@ DEFAULT_STATE = {
     "last_svitlo_message_id": None,
     "last_svitlo_ts": 0,
     "daily": {},  # {"2026-11-06": {"on":..,"off":..,"total":..}} — замір о 12:05
+    "last_yasno_updated": None,  # ISO timestamp останнього оновлення графіка
+    "last_yasno_tomorrow_date": None,  # дата, для якої вже відправили графік на завтра
 }
 
 

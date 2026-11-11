@@ -20,6 +20,7 @@ ADMIN_IDS = _int_set(os.getenv("ADMIN_IDS"))
 # --- Джерела даних ---
 SVITLOBOT_API = "https://api.svitlobot.in.ua/website/getChannelsForMap"
 HISTORY_API = "https://api.svitlobot.in.ua/website/getMapHistory"
+YASNO_SCHEDULE_API = "https://app.yasno.ua/api/blackout-service/public/shutdowns/regions/25/dsos/902/planned-outages"
 TRYVOHA_KYIV = "https://tryvoha.online/api/v1/alerts/kyiv"
 MAPA_NEARBY = "https://mapa.ua/api/v1/nearby"
 NEPTUN_THREATS = "https://neptun.in.ua/api/v1/threats"

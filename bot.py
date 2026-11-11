@@ -22,12 +22,15 @@ from svitlo import (
     create_stats_image,
     create_24h_image,
     create_week_image,
+    create_yasno_image,
     format_districts_full,
     format_svitlo_caption,
     format_24h_caption,
     format_week_caption,
+    format_yasno_caption,
     get_svitlobot_stats,
     compute_kyiv_history,
+    fetch_yasno_schedule,
     parse_stats_caption,
 )
 from timeutils import kyiv_date_str, now_kyiv_str, parse_started_at
@@ -50,6 +53,7 @@ HELP_TEXT = (
     "/rayony — світло по районах\n"
     "/doba — статистика за останні 24 години\n"
     "/tyzhden — тижнева статистика\n"
+    "/grafik — графік відключень Yasno\n"
     "/tryvoga — статус тривоги\n"
     "/tsili — цілі по Києву та області\n"
     "/status — створити/оновити закріплений живий пост\n"
@@ -353,6 +357,30 @@ async def cmd_tyzhden(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Помилка при формуванні тижневої статистики 😔", disable_notification=True)
 
 
+async def cmd_grafik(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /grafik — актуальний графік відключень Yasno."""
+    schedule = await asyncio.to_thread(fetch_yasno_schedule)
+    if not schedule:
+        await update.message.reply_text("Не вдалося отримати графік Yasno 😔", disable_notification=True)
+        return
+    try:
+        # Спочатку today, якщо є дані
+        day = "today"
+        first = next(iter(schedule.values()), {})
+        if not first.get("today", {}).get("slots"):
+            day = "tomorrow"
+        img = await asyncio.to_thread(create_yasno_image, schedule, day)
+        caption = format_yasno_caption(schedule, day)
+        await update.message.reply_photo(
+            photo=InputFile(img, filename="yasno.png"),
+            caption=caption[:1024],
+            disable_notification=True,
+        )
+    except Exception as e:
+        logger.error(f"cmd_grafik error: {e}")
+        await update.message.reply_text("Помилка при формуванні графіка 😔", disable_notification=True)
+
+
 async def check_alert(app: Application):
     alert = await asyncio.to_thread(get_kyiv_alert)
     if alert is None:
@@ -419,6 +447,61 @@ async def check_alert(app: Application):
     save_state(state)
 
 
+async def check_yasno_schedule(app: Application):
+    """Перевіряє оновлення графіків Yasno і надсилає картинку (зі звуком)."""
+    schedule = await asyncio.to_thread(fetch_yasno_schedule)
+    if not schedule:
+        return
+
+    # Беремо updatedOn з першої групи
+    first_group = next(iter(schedule.values()), {})
+    updated = first_group.get("updatedOn")
+    if not updated:
+        return
+
+    last_updated = state.get("last_yasno_updated")
+    tomorrow_info = next((g.get("tomorrow", {}) for g in schedule.values() if g.get("tomorrow")), {})
+    tomorrow_date = tomorrow_info.get("date", "")[:10] if tomorrow_info else None
+    tomorrow_status = tomorrow_info.get("status", "")
+    last_tomorrow = state.get("last_yasno_tomorrow_date")
+
+    # Надсилаємо якщо:
+    # 1) з'явився графік на завтра (статус не WaitingForSchedule)
+    # 2) або оновився поточний графік і ми ще не надсилали сьогодні
+    should_send = False
+    day_to_send = "today"
+    reason = ""
+
+    if tomorrow_status and tomorrow_status != "WaitingForSchedule" and tomorrow_date and tomorrow_date != last_tomorrow:
+        should_send = True
+        day_to_send = "tomorrow"
+        reason = f"графік на завтра ({tomorrow_date})"
+    elif updated != last_updated:
+        should_send = True
+        day_to_send = "today"
+        reason = "оновлення графіка"
+
+    if not should_send:
+        return
+
+    try:
+        img = await asyncio.to_thread(create_yasno_image, schedule, day_to_send)
+        caption = format_yasno_caption(schedule, day_to_send)
+        await app.bot.send_photo(
+            chat_id=CHAT_ID,
+            photo=InputFile(img, filename=f"yasno_{day_to_send}.png"),
+            caption=caption[:1024],
+            disable_notification=False,  # зі звуком
+        )
+        state["last_yasno_updated"] = updated
+        if day_to_send == "tomorrow" and tomorrow_date:
+            state["last_yasno_tomorrow_date"] = tomorrow_date
+        save_state(state)
+        logger.info(f"Sent Yasno schedule: {reason}")
+    except Exception as e:
+        logger.error(f"check_yasno_schedule error: {e}")
+
+
 # ================== ЗАПУСК ==================
 async def post_init(app: Application):
     await app.bot.set_my_commands([
@@ -426,6 +509,7 @@ async def post_init(app: Application):
         BotCommand("rayony", "Світло по районах"),
         BotCommand("doba", "Статистика за 24 години"),
         BotCommand("tyzhden", "Тижнева статистика"),
+        BotCommand("grafik", "Графік відключень Yasno"),
         BotCommand("tryvoga", "Статус тривоги"),
         BotCommand("tsili", "Цілі по Києву та області"),
         BotCommand("status", "Живий закріплений пост"),
@@ -439,6 +523,7 @@ async def post_init(app: Application):
     scheduler.add_job(send_24h_stats, "cron", hour=11, minute=0, args=[app], max_instances=1, coalesce=True)
     # Тижневий підсумок по понеділках о 11:30
     scheduler.add_job(send_week_stats, "cron", day_of_week="mon", hour=11, minute=30, args=[app], max_instances=1, coalesce=True)
+    scheduler.add_job(check_yasno_schedule, "interval", minutes=3, args=[app], max_instances=1, coalesce=True)
     scheduler.add_job(check_alert, "interval", seconds=18, args=[app], max_instances=1, coalesce=True)
     scheduler.start()
     logger.info("Планувальник запущено")
@@ -459,6 +544,7 @@ def main():
     app.add_handler(CommandHandler("vidnovyty", cmd_vidnovyty))
     app.add_handler(CommandHandler("doba", cmd_doba))
     app.add_handler(CommandHandler("tyzhden", cmd_tyzhden))
+    app.add_handler(CommandHandler("grafik", cmd_grafik))
     app.add_handler(CallbackQueryHandler(on_update_button, pattern="^update_alert$"))
 
     logger.info("Бот запущено")

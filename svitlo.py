@@ -598,3 +598,118 @@ def format_week_caption(hist: dict) -> str:
     lines.append("")
     lines.append(f"🕐 {ts_kyiv_str(hist['to_ts'])} · svitlobot.in.ua")
     return "\n".join(lines)
+
+
+# ================== ГРАФІКИ YASNO ==================
+from config import YASNO_SCHEDULE_API
+
+def fetch_yasno_schedule() -> dict | None:
+    """Завантажує графіки відключень Yasno для Києва (60 груп)."""
+    try:
+        r = requests.get(YASNO_SCHEDULE_API, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+        r.raise_for_status()
+        data = r.json()
+        if not isinstance(data, dict) or not data:
+            return None
+        return data
+    except Exception as e:
+        logger.error(f"Yasno schedule error: {e}")
+        return None
+
+
+def _minutes_to_hhmm(m: int) -> str:
+    h, mm = divmod(m, 60)
+    return f"{h:02d}:{mm:02d}"
+
+
+def create_yasno_image(schedule: dict, day: str = "today") -> BytesIO:
+    """Генерує чисту картинку з графіками всіх груп."""
+    groups = sorted(schedule.keys(), key=lambda x: (int(x.split(".")[0]), x))
+    n = len(groups)
+
+    # Більше місця по висоті, щоб текст не наїжджав
+    fig, ax = plt.subplots(figsize=(16, max(16, n * 0.55)), facecolor=BG)
+    ax.set_facecolor(BG)
+
+    day_label = "Сьогодні" if day == "today" else "Завтра"
+    fig.text(0.5, 0.99, f"Графік відключень · Київ · {day_label}",
+             ha="center", va="top", color="white", fontsize=20, fontweight="bold")
+
+    y_positions = list(range(n - 1, -1, -1))
+
+    for y, grp in zip(y_positions, groups):
+        info = schedule[grp].get(day, {})
+        slots = info.get("slots", [])
+
+        # Фон (світло є)
+        ax.barh(y, 24, height=0.42, left=0, color="#2a2a45", zorder=1)
+
+        # Відключення
+        intervals = []
+        for s in slots:
+            if s.get("type") == "Definite":
+                start_h = s["start"] / 60.0
+                end_h = s["end"] / 60.0
+                ax.barh(y, end_h - start_h, height=0.42, left=start_h,
+                        color="#e53935", zorder=2)
+                intervals.append(f"{_minutes_to_hhmm(s['start'])}–{_minutes_to_hhmm(s['end'])}")
+
+        # Група зліва
+        ax.text(-1.8, y, grp, ha="right", va="center", color="white",
+                fontsize=11, fontweight="bold")
+
+        # Інтервали справа від бару, рівно
+        if intervals:
+            text = " · ".join(intervals)
+            ax.text(24.6, y, text, ha="left", va="center",
+                    color="#b0bec5", fontsize=8.5)
+
+        # Години без світла ще правіше
+        off_min = sum(s["end"] - s["start"] for s in slots if s.get("type") == "Definite")
+        off_h = round(off_min / 60, 1)
+        ax.text(38.5, y, f"{off_h} год", ha="left", va="center",
+                color="#90a4ae", fontsize=9)
+
+    ax.set_xlim(-3.5, 42)
+    ax.set_ylim(-0.6, n - 0.4)
+    ax.set_yticks([])
+    ax.set_xticks(range(0, 25, 3))
+    ax.set_xticklabels([f"{h:02d}" for h in range(0, 25, 3)], color="#cfd8dc", fontsize=11)
+    ax.tick_params(axis="x", colors="#546e7a", length=0, pad=6)
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+
+    fig.text(0.5, 0.005, "Дякуємо Yasno · yasno.com.ua · тільки Київ",
+             ha="center", color="#78909c", fontsize=11)
+
+    buf = BytesIO()
+    fig.savefig(buf, format="png", dpi=130, bbox_inches="tight", facecolor=fig.get_facecolor())
+    buf.seek(0)
+    plt.close(fig)
+    return buf
+
+
+def format_yasno_caption(schedule: dict, day: str = "today") -> str:
+    groups = sorted(schedule.keys(), key=lambda x: (int(x.split(".")[0]), x))
+    day_label = "сьогодні" if day == "today" else "завтра"
+
+    lines = [
+        f"⚡️ Графік відключень · Київ · {day_label}",
+        "",
+    ]
+
+    # Короткий підсумок
+    total_off = 0
+    for grp in groups:
+        slots = schedule[grp].get(day, {}).get("slots", [])
+        total_off += sum(s["end"] - s["start"] for s in slots if s.get("type") == "Definite")
+    avg_off = round(total_off / len(groups) / 60, 1) if groups else 0
+    lines.append(f"📊 Середнє без світла: ~{avg_off} год на групу")
+    lines.append(f"🔢 Груп: {len(groups)}")
+    lines.append("")
+    lines.append("🔴 Червоні смуги — заплановані відключення")
+    lines.append("")
+    lines.append("Дякуємо Yasno за дані 🙏")
+    lines.append("yasno.com.ua")
+
+    return "\n".join(lines)
